@@ -31,9 +31,11 @@ from prompt_toolkit.styles import Style
 from prompt_toolkit.data_structures import Point
 from prompt_toolkit.widgets import Frame, TextArea
 from rich.console import Console
-from rich.markdown import CodeBlock, Markdown
+from rich.markdown import BlockQuote, CodeBlock, Markdown
 from rich.padding import Padding
 from rich.rule import Rule
+from rich.segment import Segment
+from rich.style import Style as RichStyle
 from rich.syntax import Syntax
 from rich.text import Text
 
@@ -96,9 +98,23 @@ class HighlightedCodeBlock(CodeBlock):
         yield Syntax(code, lexer, theme=self.theme, word_wrap=True, padding=1)
 
 
+class CompactBlockQuote(BlockQuote):
+    """Render quotes as a narrow rail instead of a full-width block."""
+
+    def __rich_console__(self, console: Console, options: Any) -> Any:
+        quote_options = options.update(width=max(1, options.max_width - 4))
+        lines = console.render_lines(self.elements, quote_options, style=self.style)
+        rail = Segment("│ ", RichStyle(color="#6b7280", dim=True))
+        for line in lines:
+            yield rail
+            yield from line
+            yield Segment("\n")
+
+
 class ChatMarkdown(Markdown):
     elements = {
         **Markdown.elements,
+        "blockquote_open": CompactBlockQuote,
         "fence": HighlightedCodeBlock,
         "code_block": HighlightedCodeBlock,
     }
