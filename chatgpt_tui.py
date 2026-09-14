@@ -133,6 +133,29 @@ class ComposerPlaceholderProcessor(Processor):
         )
 
 
+class TranscriptWindow(Window):
+    """A Window with the multi-line wheel movement users expect in terminals."""
+
+    def __init__(self, *args: Any, on_manual_scroll: Callable[[], None], **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.on_manual_scroll = on_manual_scroll
+
+    def _scroll_up(self) -> None:
+        info = self.render_info
+        if info is None:
+            return
+        self.on_manual_scroll()
+        self.vertical_scroll = max(0, info.vertical_scroll - 4)
+
+    def _scroll_down(self) -> None:
+        info = self.render_info
+        if info is None:
+            return
+        self.on_manual_scroll()
+        last_scroll = max(0, info.content_height - info.window_height)
+        self.vertical_scroll = min(last_scroll, info.vertical_scroll + 4)
+
+
 def render_chatgpt_annotations(text: str) -> str:
     """Turn ChatGPT web's private-use annotations into terminal-safe text."""
 
@@ -211,17 +234,20 @@ class ChatTui:
         self.active_started: float | None = None
         self.last_elapsed: float | None = None
         self.render_cache: dict[tuple[str, str, int, bool], str] = {}
+        self.formatted_transcript_source = ""
+        self.formatted_transcript: ANSI = ANSI("")
 
         self.transcript_control = FormattedTextControl(
-            text=lambda: ANSI(self.render_transcript()),
+            text=self.render_formatted_transcript,
             focusable=True,
             get_cursor_position=self.transcript_cursor_position,
         )
-        self.transcript_window = Window(
+        self.transcript_window = TranscriptWindow(
             content=self.transcript_control,
             wrap_lines=True,
             right_margins=[],
             allow_scroll_beyond_bottom=False,
+            on_manual_scroll=self.pause_following,
         )
         self.input = TextArea(
             height=D(min=1, max=6),
@@ -411,6 +437,13 @@ class ChatTui:
         self.transcript_line_count = rendered.count("\n") + 1
         return rendered
 
+    def render_formatted_transcript(self) -> ANSI:
+        rendered = self.render_transcript()
+        if rendered != self.formatted_transcript_source:
+            self.formatted_transcript_source = rendered
+            self.formatted_transcript = ANSI(rendered)
+        return self.formatted_transcript
+
     def render_message(
         self,
         role: str,
@@ -566,15 +599,16 @@ class ChatTui:
 
         @bindings.add("pageup")
         def page_up(_event: Any) -> None:
-            self.follow_output = False
+            self.pause_following()
+            page = self.transcript_page_size()
             self.transcript_window.vertical_scroll = max(
-                0, self.transcript_window.vertical_scroll - 10
+                0, self.transcript_window.vertical_scroll - page
             )
 
         @bindings.add("pagedown")
         def page_down(_event: Any) -> None:
-            self.follow_output = False
-            self.transcript_window.vertical_scroll += 10
+            self.pause_following()
+            self.transcript_window.vertical_scroll += self.transcript_page_size()
 
         @bindings.add("end")
         def follow_bottom(_event: Any) -> None:
@@ -583,6 +617,15 @@ class ChatTui:
             self.app.invalidate()
 
         return bindings
+
+    def pause_following(self) -> None:
+        self.follow_output = False
+
+    def transcript_page_size(self) -> int:
+        info = self.transcript_window.render_info
+        if info is None:
+            return 10
+        return max(3, info.window_height - 3)
 
     def append_system(self, text: str) -> None:
         with self.lock:
