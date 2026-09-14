@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from io import StringIO
+import base64
 import os
 from pathlib import Path
 import re
+import shutil
+import subprocess
 import threading
 import time
 from datetime import datetime
@@ -97,6 +100,7 @@ class SlashCommandCompleter(Completer):
         ("/new", "start a new conversation"),
         ("/resume", "search recent conversations"),
         ("/history", "reload this conversation"),
+        ("/copy", "copy the latest response"),
         ("/clear", "clear the displayed transcript"),
         ("/help", "show available commands"),
         ("/exit", "quit chatgpt-web"),
@@ -639,6 +643,8 @@ class ChatTui:
             else:
                 self.status = "No saved conversation yet"
                 self.app.invalidate()
+        elif name == "/copy":
+            self.copy_latest_response()
         elif name == "/help":
             self.append_system(
                 "**Commands**\n\n"
@@ -646,12 +652,61 @@ class ChatTui:
                 "- `/resume` search recent conversations\n"
                 "- `/resume ID` open a conversation directly\n"
                 "- `/history` reload this conversation\n"
+                "- `/copy` copy the latest assistant response\n"
                 "- `/clear` clear the displayed transcript\n"
                 "- `/exit` quit"
             )
         else:
             self.status = f"Unknown command: {name}"
             self.app.invalidate()
+
+    def copy_latest_response(self) -> None:
+        with self.lock:
+            response = next(
+                (
+                    message["text"]
+                    for message in reversed(self.messages)
+                    if message["role"] == "assistant" and message["text"]
+                ),
+                "",
+            )
+        if not response:
+            self.status = "No assistant response to copy"
+            self.app.invalidate()
+            return
+
+        response = render_chatgpt_annotations(response)
+        clipboard_commands = (
+            ("wl-copy", ["wl-copy"]),
+            ("xclip", ["xclip", "-selection", "clipboard"]),
+            ("xsel", ["xsel", "--clipboard", "--input"]),
+            ("pbcopy", ["pbcopy"]),
+        )
+        for executable, command in clipboard_commands:
+            if shutil.which(executable) is None:
+                continue
+            try:
+                subprocess.run(
+                    command,
+                    input=response,
+                    text=True,
+                    check=True,
+                    timeout=3,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                self.status = "Copied latest response"
+                self.app.invalidate()
+                return
+            except (OSError, subprocess.SubprocessError):
+                continue
+
+        # OSC 52 is supported by many terminal emulators and remote sessions.
+        encoded = base64.b64encode(response.encode()).decode("ascii")
+        self.app.output.write_raw(f"\x1b]52;c;{encoded}\x07")
+        self.app.output.flush()
+        self.status = "Sent latest response to the terminal clipboard"
+        self.app.invalidate()
 
     def open_resume(self) -> None:
         if self.busy or self.resume_visible:
