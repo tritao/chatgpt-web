@@ -120,6 +120,27 @@ class ChatMarkdown(Markdown):
     }
 
 
+class PromptMarkdown:
+    """Markdown content with a Codex-style prompt marker on its first line."""
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+    def __rich_console__(self, console: Console, options: Any) -> Any:
+        content_options = options.update(width=max(1, options.max_width - 2))
+        lines = console.render_lines(
+            ChatMarkdown(self.text, code_theme="monokai"),
+            content_options,
+            pad=False,
+        )
+        for index, line in enumerate(lines):
+            marker = "› " if index == 0 else "  "
+            style = RichStyle(color="#67e8f9", bold=True) if index == 0 else None
+            yield Segment(marker, style)
+            yield from line
+            yield Segment("\n")
+
+
 class SlashCommandCompleter(Completer):
     COMMANDS = (
         ("/new", "start a new conversation"),
@@ -215,6 +236,11 @@ def render_chatgpt_annotations(text: str) -> str:
         return ""
 
     rendered = ANNOTATION_PATTERN.sub(replace, text)
+    # Some ChatGPT Web conversation nodes escape every Markdown delimiter in
+    # otherwise complete Markdown. Only unescape after detecting a fenced block
+    # so intentional backslashes in ordinary prose and source code survive.
+    if re.search(r"(?m)^\s*\\`\\`\\`", rendered):
+        rendered = re.sub(r"\\([`*_{}\[\]()#+.!>|~-])", r"\1", rendered)
     # Streaming can end between the opening marker and its terminator. Hide the
     # incomplete suffix until the next delta completes it.
     rendered = re.sub(r"\ue200[^\ue201]*$", "", rendered)
@@ -643,11 +669,13 @@ class ChatTui:
         if separated and role == "user":
             console.print(Rule(style="#606060"))
         if role == "user":
-            prompt = Text()
-            prompt.append("› ", style="bold #67e8f9")
-            prompt.append(text, style="#f3f4f6")
             console.print(
-                Padding(prompt, (1, 2), style="on #4b4b4b", expand=True)
+                Padding(
+                    PromptMarkdown(text),
+                    (1, 2),
+                    style="#f3f4f6 on #4b4b4b",
+                    expand=True,
+                )
             )
         elif role == "assistant":
             console.print(Text("• ", style="bold #86efac"), end="")
