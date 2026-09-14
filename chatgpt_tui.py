@@ -723,6 +723,10 @@ class ChatTui:
                     except OSError:
                         pass
                 self.app.invalidate()
+            elif self.input.text:
+                self.input.buffer.reset()
+                self.status = "Prompt cleared"
+                self.app.invalidate()
             else:
                 self.status = "Press /exit or Ctrl+D to quit"
                 self.app.invalidate()

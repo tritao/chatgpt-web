@@ -70,7 +70,7 @@ ln -s "$(pwd)/run" ~/.local/bin/chatgpt-web
 | `Alt+Enter` | Insert a newline |
 | `Ctrl+R` | Open the searchable conversation picker |
 | `Ctrl+V` | Attach a PNG image from the clipboard |
-| `Ctrl+C` | Stop an active response |
+| `Ctrl+C` | Clear the prompt, or stop an active response |
 | `Ctrl+D` | Exit from an empty prompt |
 | `PageUp` / `PageDown` | Move through the transcript |
 | `End` | Follow new output at the bottom |
