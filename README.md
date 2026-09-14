@@ -86,6 +86,7 @@ Type `/` to open command completion:
 | `/resume` | Search recent conversations |
 | `/resume ID` | Open a conversation directly |
 | `/history` | Reload the current conversation |
+| `/rename TITLE` | Rename the current conversation |
 | `/copy` | Copy the latest assistant response |
 | `/remove` | Remove the latest pending image |
 | `/clear` | Clear the displayed transcript |
@@ -101,6 +102,7 @@ The same session can be used without the interactive UI:
 ./run list --limit 100
 ./run list --all --output jsonl
 ./run show CONVERSATION_ID
+./run rename CONVERSATION_ID "New title"
 ./run new "Explain monads in one paragraph"
 ./run send CONVERSATION_ID "Continue with an example"
 ./run resume CONVERSATION_ID

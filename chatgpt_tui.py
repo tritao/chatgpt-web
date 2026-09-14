@@ -54,6 +54,7 @@ SendPrompt = Callable[
     dict[str, Any],
 ]
 UploadImage = Callable[[bytes, str, str, int, int], dict[str, Any]]
+RenameConversation = Callable[[str, str], None]
 
 ANNOTATION_PATTERN = re.compile(r"\ue200([^\ue201\ue202]+)(?:\ue202(.*?))?\ue201")
 WRITING_DIRECTIVE_PATTERN = re.compile(
@@ -146,6 +147,7 @@ class SlashCommandCompleter(Completer):
         ("/new", "start a new conversation"),
         ("/resume", "search recent conversations"),
         ("/history", "reload this conversation"),
+        ("/rename", "rename this conversation"),
         ("/copy", "copy the latest response"),
         ("/remove", "remove the latest image"),
         ("/clear", "clear the displayed transcript"),
@@ -280,11 +282,13 @@ class ChatTui:
         initial_messages: list[dict[str, Any]] | None = None,
         model: str | None = None,
         upload_image: UploadImage | None = None,
+        rename_conversation: RenameConversation | None = None,
     ) -> None:
         self.list_conversations = list_conversations
         self.load_conversation = load_conversation
         self.send_prompt = send_prompt
         self.upload_image = upload_image
+        self.rename_conversation = rename_conversation
         self.conversation_id = conversation_id
         self.title = title
         self.model = model or os.environ.get("CHATGPT_WEB_MODEL", "gpt-5-6-thinking")
@@ -975,6 +979,8 @@ class ChatTui:
             else:
                 self.status = "No saved conversation yet"
                 self.app.invalidate()
+        elif name == "/rename":
+            self.rename_current_conversation(argument)
         elif name == "/copy":
             self.copy_latest_response()
         elif name == "/remove":
@@ -991,6 +997,7 @@ class ChatTui:
                 "- `/resume` search recent conversations\n"
                 "- `/resume ID` open a conversation directly\n"
                 "- `/history` reload this conversation\n"
+                "- `/rename TITLE` rename this conversation\n"
                 "- `/copy` copy the latest assistant response\n"
                 "- `/remove` remove the latest pending image\n"
                 "- `/clear` clear the displayed transcript\n"
@@ -999,6 +1006,35 @@ class ChatTui:
         else:
             self.status = f"Unknown command: {name}"
             self.app.invalidate()
+
+    def rename_current_conversation(self, title: str) -> None:
+        title = title.strip()
+        if self.conversation_id is None:
+            self.status = "Save the conversation before renaming it"
+            self.app.invalidate()
+            return
+        if not title:
+            self.status = "Usage: /rename TITLE"
+            self.app.invalidate()
+            return
+        if self.rename_conversation is None:
+            self.status = "Conversation rename is unavailable"
+            self.app.invalidate()
+            return
+        conversation_id = self.conversation_id
+        self.status = "Renaming conversation…"
+        self.app.invalidate()
+
+        def rename() -> None:
+            try:
+                self.rename_conversation(conversation_id, title)
+                self.title = title
+                self.status = "Conversation renamed"
+            except Exception as error:
+                self.status = f"Rename failed: {error}"
+            self.app.invalidate()
+
+        threading.Thread(target=rename, daemon=True).start()
 
     @staticmethod
     def read_clipboard_png() -> bytes:
@@ -1286,6 +1322,7 @@ def run_tui(
     initial_messages: list[dict[str, Any]] | None = None,
     model: str | None = None,
     upload_image: UploadImage | None = None,
+    rename_conversation: RenameConversation | None = None,
 ) -> None:
     ChatTui(
         list_conversations,
@@ -1296,4 +1333,5 @@ def run_tui(
         initial_messages,
         model,
         upload_image,
+        rename_conversation,
     ).run()

@@ -301,6 +301,13 @@ class ChatGPTWebClient:
             raise ChatGPTWebError("conversation response was not an object")
         return result
 
+    def rename_conversation(self, conversation_id: str, title: str) -> None:
+        self.request(
+            "PATCH",
+            urljoin(CHATGPT_ORIGIN, f"/backend-api/conversation/{conversation_id}"),
+            json={"title": title},
+        )
+
     def send_prompt(
         self,
         conversation_id: str | None,
@@ -1075,6 +1082,13 @@ def run_fullscreen(
             "height": height,
         }).get("attachment", {})
 
+    def rename(selected_id: str, new_title: str) -> None:
+        daemon_request(socket_path, {
+            "command": "rename",
+            "conversation_id": selected_id,
+            "title": new_title,
+        })
+
     run_tui(
         list_recent,
         load,
@@ -1082,6 +1096,7 @@ def run_fullscreen(
         conversation_id=conversation_id,
         title="Loading conversation" if conversation_id else "New conversation",
         upload_image=upload_image,
+        rename_conversation=rename,
     )
     return 0
 
@@ -1321,6 +1336,18 @@ def handle_daemon_command(
                 client.get_conversation(conversation_id)
             )
         }, False
+    if command == "rename":
+        conversation_id = request.get("conversation_id")
+        title = request.get("title")
+        if not isinstance(conversation_id, str) or not conversation_id:
+            raise ChatGPTWebError("conversation ID is required")
+        if not isinstance(title, str) or not title.strip():
+            raise ChatGPTWebError("conversation title is required")
+        title = title.strip()
+        if len(title) > 256:
+            raise ChatGPTWebError("conversation title must be 256 characters or fewer")
+        client.rename_conversation(conversation_id, title)
+        return {"conversation_id": conversation_id, "title": title}, False
     if command == "send":
         conversation_id = request.get("conversation_id")
         prompt = request.get("prompt")
@@ -1489,6 +1516,9 @@ def build_parser() -> argparse.ArgumentParser:
     show_parser.add_argument(
         "--output", choices=("markdown", "json", "jsonl"), default="markdown"
     )
+    rename_parser = commands.add_parser("rename", help="rename a conversation")
+    rename_parser.add_argument("conversation_id")
+    rename_parser.add_argument("title", nargs="+")
     send_parser = commands.add_parser("send", help="send a prompt")
     send_parser.add_argument("conversation_id")
     send_parser.add_argument("prompt", nargs="*")
@@ -1563,6 +1593,13 @@ def main() -> int:
                 "conversation_id": args.conversation_id,
             })
             print_conversation(result.get("conversation", {}), args.output)
+        elif args.command == "rename":
+            result = daemon_request(args.socket, {
+                "command": "rename",
+                "conversation_id": args.conversation_id,
+                "title": " ".join(args.title),
+            })
+            print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
         elif args.command in ("send", "new"):
             prompt = " ".join(args.prompt).strip()
             if not prompt and not sys.stdin.isatty():
