@@ -4,13 +4,15 @@ from __future__ import annotations
 
 from io import StringIO
 import threading
+from datetime import datetime
 from typing import Any, Callable
 
 from prompt_toolkit.application import Application
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.formatted_text import ANSI, FormattedText
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.layout import HSplit, Layout, Window
+from prompt_toolkit.layout import Float, FloatContainer, HSplit, Layout, Window
+from prompt_toolkit.layout.containers import ConditionalContainer
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.layout.dimension import D
 from prompt_toolkit.styles import Style
@@ -22,6 +24,7 @@ from rich.text import Text
 
 Message = dict[str, str]
 LoadConversation = Callable[[str], dict[str, Any]]
+ListConversations = Callable[[], list[dict[str, Any]]]
 SendPrompt = Callable[
     [str | None, str, Callable[[dict[str, Any]], None], Callable[[Any], None]],
     dict[str, Any],
@@ -31,12 +34,14 @@ SendPrompt = Callable[
 class ChatTui:
     def __init__(
         self,
+        list_conversations: ListConversations,
         load_conversation: LoadConversation,
         send_prompt: SendPrompt,
         conversation_id: str | None = None,
         title: str = "New conversation",
         initial_messages: list[dict[str, Any]] | None = None,
     ) -> None:
+        self.list_conversations = list_conversations
         self.load_conversation = load_conversation
         self.send_prompt = send_prompt
         self.conversation_id = conversation_id
@@ -51,6 +56,12 @@ class ChatTui:
         self.status = "Ready"
         self.cancel_connection: Any = None
         self.lock = threading.RLock()
+        self.resume_visible = False
+        self.resume_loading = False
+        self.resume_items: list[dict[str, Any]] = []
+        self.resume_filtered: list[dict[str, Any]] = []
+        self.resume_index = 0
+        self.resume_filter = Condition(lambda: self.resume_visible)
 
         self.transcript_control = FormattedTextControl(
             text=lambda: ANSI(self.render_transcript()),
@@ -69,8 +80,23 @@ class ChatTui:
             prompt="❯ ",
             read_only=Condition(lambda: self.busy),
         )
+        self.resume_search = TextArea(
+            height=1,
+            multiline=False,
+            prompt="Search: ",
+        )
+        self.resume_search.buffer.on_text_changed += lambda _buffer: self.filter_resume()
+        self.resume_list_control = FormattedTextControl(
+            text=self.render_resume_list,
+            focusable=True,
+        )
+        self.resume_list_window = Window(
+            content=self.resume_list_control,
+            wrap_lines=False,
+            always_hide_cursor=True,
+        )
         self.bindings = self.make_bindings()
-        root = HSplit([
+        base = HSplit([
             Window(
                 height=1,
                 content=FormattedTextControl(self.render_header),
@@ -88,11 +114,39 @@ class ChatTui:
             Window(
                 height=1,
                 content=FormattedTextControl(
-                    text=" Enter send  Alt+Enter newline  Ctrl+C stop  /help commands "
+                    text=" Enter send  Alt+Enter newline  Ctrl+R resume  Ctrl+C stop "
                 ),
                 style="class:help",
             ),
         ])
+        resume_dialog = ConditionalContainer(
+            content=Frame(
+                HSplit([
+                    self.resume_search,
+                    Window(height=1, char="─", style="class:separator"),
+                    self.resume_list_window,
+                    Window(
+                        height=1,
+                        content=FormattedTextControl(
+                            " ↑/↓ select  Enter open  Esc close "
+                        ),
+                        style="class:help",
+                    ),
+                ]),
+                title="Resume conversation",
+            ),
+            filter=self.resume_filter,
+        )
+        root = FloatContainer(
+            content=base,
+            floats=[Float(
+                content=resume_dialog,
+                left=4,
+                right=4,
+                top=2,
+                bottom=2,
+            )],
+        )
         self.app: Application[Any] = Application(
             layout=Layout(root, focused_element=self.input),
             key_bindings=self.bindings,
@@ -107,6 +161,9 @@ class ChatTui:
                 "help": "bg:#1f2937 #9ca3af",
                 "frame.label": "#5eead4",
                 "frame.border": "#4b5563",
+                "resume.selected": "bg:#0f766e #ffffff bold",
+                "resume.item": "#d1d5db",
+                "resume.time": "#9ca3af",
             }),
         )
 
@@ -159,6 +216,27 @@ class ChatTui:
                 console.print(Markdown(text))
         return buffer.getvalue()
 
+    def render_resume_list(self) -> FormattedText:
+        if self.resume_loading:
+            return FormattedText([("class:resume.time", " Loading conversations…")])
+        if not self.resume_filtered:
+            return FormattedText([("class:resume.time", " No matching conversations")])
+        fragments: list[tuple[str, str]] = []
+        for index, item in enumerate(self.resume_filtered):
+            title = item.get("title") or "Untitled"
+            updated = item.get("update_time")
+            stamp = ""
+            if isinstance(updated, (int, float)):
+                try:
+                    stamp = datetime.fromtimestamp(updated).strftime("%Y-%m-%d %H:%M")
+                except (OSError, OverflowError, ValueError):
+                    pass
+            marker = "›" if index == self.resume_index else " "
+            style = "class:resume.selected" if index == self.resume_index else "class:resume.item"
+            fragments.append((style, f" {marker} {str(title)[:72]:<72} "))
+            fragments.append(("class:resume.time", f"{stamp}\n"))
+        return FormattedText(fragments)
+
     def make_bindings(self) -> KeyBindings:
         bindings = KeyBindings()
 
@@ -195,6 +273,34 @@ class ChatTui:
         def exit_app(event: Any) -> None:
             if not self.busy and not self.input.text:
                 event.app.exit()
+
+        @bindings.add("c-r", eager=True)
+        def resume_picker(_event: Any) -> None:
+            self.open_resume()
+
+        @bindings.add("up", filter=self.resume_filter, eager=True)
+        def resume_up(_event: Any) -> None:
+            if self.resume_filtered:
+                self.resume_index = max(0, self.resume_index - 1)
+                self.resume_list_window.vertical_scroll = max(0, self.resume_index - 2)
+                self.app.invalidate()
+
+        @bindings.add("down", filter=self.resume_filter, eager=True)
+        def resume_down(_event: Any) -> None:
+            if self.resume_filtered:
+                self.resume_index = min(
+                    len(self.resume_filtered) - 1, self.resume_index + 1
+                )
+                self.resume_list_window.vertical_scroll = max(0, self.resume_index - 2)
+                self.app.invalidate()
+
+        @bindings.add("enter", filter=self.resume_filter, eager=True)
+        def resume_selected(_event: Any) -> None:
+            self.select_resume()
+
+        @bindings.add("escape", filter=self.resume_filter, eager=True)
+        def close_resume(_event: Any) -> None:
+            self.close_resume()
 
         @bindings.add("pageup")
         def page_up(_event: Any) -> None:
@@ -251,8 +357,11 @@ class ChatTui:
                 self.messages.clear()
             self.status = "Transcript cleared"
             self.scroll_bottom()
-        elif name == "/resume" and argument.strip():
-            self.resume_conversation(argument.strip())
+        elif name == "/resume":
+            if argument.strip():
+                self.resume_conversation(argument.strip())
+            else:
+                self.open_resume()
         elif name == "/history":
             if self.conversation_id:
                 self.resume_conversation(self.conversation_id)
@@ -263,7 +372,8 @@ class ChatTui:
             self.append_system(
                 "**Commands**\n\n"
                 "- `/new` start a conversation\n"
-                "- `/resume ID` open a conversation\n"
+                "- `/resume` search recent conversations\n"
+                "- `/resume ID` open a conversation directly\n"
                 "- `/history` reload this conversation\n"
                 "- `/clear` clear the displayed transcript\n"
                 "- `/exit` quit"
@@ -272,25 +382,86 @@ class ChatTui:
             self.status = f"Unknown command: {name}"
             self.app.invalidate()
 
+    def open_resume(self) -> None:
+        if self.busy or self.resume_visible:
+            return
+        self.resume_visible = True
+        self.resume_loading = True
+        self.resume_items = []
+        self.resume_filtered = []
+        self.resume_index = 0
+        self.resume_search.text = ""
+        self.status = "Loading recent conversations…"
+        self.app.layout.focus(self.resume_search)
+        self.app.invalidate()
+
+        def load_items() -> None:
+            try:
+                items = self.list_conversations()
+                self.resume_items = items
+                self.resume_loading = False
+                self.filter_resume()
+                self.status = f"{len(items)} recent conversations"
+            except Exception as error:
+                self.resume_loading = False
+                self.status = f"Conversation list failed: {error}"
+            self.app.invalidate()
+
+        threading.Thread(target=load_items, daemon=True).start()
+
+    def filter_resume(self) -> None:
+        query = self.resume_search.text.strip().casefold()
+        self.resume_filtered = [
+            item for item in self.resume_items
+            if query in str(item.get("title") or "Untitled").casefold()
+            or query in str(item.get("id") or "").casefold()
+        ]
+        self.resume_index = min(
+            self.resume_index, max(0, len(self.resume_filtered) - 1)
+        )
+        self.resume_list_window.vertical_scroll = max(0, self.resume_index - 2)
+        if hasattr(self, "app"):
+            self.app.invalidate()
+
+    def close_resume(self) -> None:
+        self.resume_visible = False
+        self.status = "Ready"
+        self.app.layout.focus(self.input)
+        self.app.invalidate()
+
+    def select_resume(self) -> None:
+        if not self.resume_filtered:
+            return
+        item = self.resume_filtered[self.resume_index]
+        conversation_id = item.get("id")
+        if not isinstance(conversation_id, str) or not conversation_id:
+            return
+        self.close_resume()
+        self.resume_conversation(conversation_id)
+
     def resume_conversation(self, conversation_id: str) -> None:
         self.status = "Loading conversation…"
         self.app.invalidate()
-        try:
-            conversation = self.load_conversation(conversation_id)
-            messages = []
-            for message in conversation.get("messages", []):
-                role, text = message.get("role"), message.get("text")
-                if isinstance(role, str) and isinstance(text, str) and text:
-                    messages.append({"role": role, "text": text})
-            with self.lock:
-                self.messages = messages
-            self.conversation_id = conversation_id
-            self.title = conversation.get("title") or "Untitled"
-            self.status = "Ready"
-            self.scroll_bottom()
-        except Exception as error:
-            self.status = f"Load failed: {error}"
-            self.app.invalidate()
+
+        def load_selected() -> None:
+            try:
+                conversation = self.load_conversation(conversation_id)
+                messages = []
+                for message in conversation.get("messages", []):
+                    role, text = message.get("role"), message.get("text")
+                    if isinstance(role, str) and isinstance(text, str) and text:
+                        messages.append({"role": role, "text": text})
+                with self.lock:
+                    self.messages = messages
+                self.conversation_id = conversation_id
+                self.title = conversation.get("title") or "Untitled"
+                self.status = "Ready"
+                self.scroll_bottom()
+            except Exception as error:
+                self.status = f"Load failed: {error}"
+                self.app.invalidate()
+
+        threading.Thread(target=load_selected, daemon=True).start()
 
     def run_send(self, prompt: str) -> None:
         rendered = ""
@@ -353,6 +524,7 @@ class ChatTui:
 
 
 def run_tui(
+    list_conversations: ListConversations,
     load_conversation: LoadConversation,
     send_prompt: SendPrompt,
     conversation_id: str | None = None,
@@ -360,6 +532,7 @@ def run_tui(
     initial_messages: list[dict[str, Any]] | None = None,
 ) -> None:
     ChatTui(
+        list_conversations,
         load_conversation,
         send_prompt,
         conversation_id,

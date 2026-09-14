@@ -943,6 +943,12 @@ def run_fullscreen(
         if isinstance(raw, dict):
             initial = normalize_conversation(raw)
 
+    def list_recent() -> list[dict[str, Any]]:
+        items = daemon_request(socket_path, {
+            "command": "list", "maximum": 50,
+        }).get("items", [])
+        return items if isinstance(items, list) else []
+
     def load(selected_id: str) -> dict[str, Any]:
         raw = daemon_request(socket_path, {
             "command": "show", "conversation_id": selected_id,
@@ -962,6 +968,7 @@ def run_fullscreen(
         }, on_event, on_connection)
 
     run_tui(
+        list_recent,
         load,
         send,
         conversation_id,

@@ -62,9 +62,11 @@ Running `chatgpt-web` without a subcommand opens a fullscreen terminal client
 with a scrollable, syntax-highlighted Markdown transcript and a multiline
 prompt fixed to the bottom. Enter submits, Alt+Enter inserts a newline, Ctrl+C
 stops an active response, Ctrl+D exits from an empty prompt, and PageUp/PageDown
-scroll the transcript. Commands include `/new`, `/resume ID`, `/history`,
-`/clear`, `/help`, and `/exit`. `chatgpt-web resume CONVERSATION_ID` opens an
-existing conversation directly in the fullscreen client.
+scroll the transcript. `/resume` or Ctrl+R opens a centered, searchable list of
+recent conversations; use Up/Down, Enter, and Escape to navigate it. Commands
+also include `/new`, `/resume ID`, `/history`, `/clear`, `/help`, and `/exit`.
+`chatgpt-web resume CONVERSATION_ID` opens an existing conversation directly in
+the fullscreen client.
 
 Set `CHATGPT_WEB_CDP_URL` or pass `--cdp-url` when Chrome uses another local
 debugging port.
