@@ -23,7 +23,6 @@ from prompt_toolkit.layout import Float, FloatContainer, HSplit, Layout, Window
 from prompt_toolkit.layout.containers import ConditionalContainer
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.layout.dimension import D
-from prompt_toolkit.layout.margins import ScrollbarMargin
 from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.layout.processors import Processor, Transformation
 from prompt_toolkit.styles import Style
@@ -246,7 +245,7 @@ class ChatTui:
         self.transcript_window = TranscriptWindow(
             content=self.transcript_control,
             wrap_lines=True,
-            right_margins=[ScrollbarMargin(display_arrows=False)],
+            right_margins=[],
             allow_scroll_beyond_bottom=False,
             on_manual_scroll=self.pause_following,
         )
@@ -334,8 +333,8 @@ class ChatTui:
         self.app: Application[Any] = Application(
             layout=Layout(root, focused_element=self.input),
             key_bindings=self.bindings,
-            full_screen=True,
-            mouse_support=True,
+            full_screen=False,
+            mouse_support=False,
             refresh_interval=0.12,
             style=Style.from_dict({
                 "separator": "#6b7280",
@@ -352,8 +351,6 @@ class ChatTui:
                 "resume.selected": "bg:#0f766e #ffffff bold",
                 "resume.item": "#d1d5db",
                 "resume.time": "#9ca3af",
-                "scrollbar.background": "bg:#303030",
-                "scrollbar.button": "bg:#737373",
                 "completion-menu": "bg:#303030 #e5e7eb",
                 "completion-menu.completion": "bg:#303030 #e5e7eb",
                 "completion-menu.completion.current": "bg:#0f766e #ffffff bold",

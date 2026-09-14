@@ -58,9 +58,10 @@ chatgpt-web
 ./chatgpt-web/run logout
 ```
 
-Running `chatgpt-web` without a subcommand opens a fullscreen terminal client
+Running `chatgpt-web` without a subcommand opens an inline terminal client
 with a scrollable, syntax-highlighted Markdown transcript and a multiline
-prompt fixed to the bottom. Enter submits, Alt+Enter inserts a newline, Ctrl+C
+prompt at the bottom. It stays on the terminal's main screen so transcript
+history participates in native terminal scrollback. Enter submits, Alt+Enter inserts a newline, Ctrl+C
 stops an active response, Ctrl+D exits from an empty prompt, and PageUp/PageDown
 scroll the transcript. New output follows the bottom automatically; PageUp
 pauses following and End resumes it. `/resume` or Ctrl+R opens a centered,
