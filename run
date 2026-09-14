@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+
+launcher_path=$(readlink -f -- "$0")
+script_dir=$(CDPATH= cd -- "$(dirname -- "$launcher_path")" && pwd)
+data_root=${XDG_DATA_HOME:-"$HOME/.local/share"}
+venv_python="$data_root/chatgpt-web/venv/bin/python"
+
+if command -v uv >/dev/null 2>&1; then
+    exec uv run --script "$script_dir/chatgpt-web" "$@"
+fi
+
+if [ -x "$venv_python" ]; then
+    exec "$venv_python" "$script_dir/chatgpt-web" "$@"
+fi
+
+exec python3 "$script_dir/chatgpt-web" "$@"

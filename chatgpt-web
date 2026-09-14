@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#   "httpx>=0.27,<1",
+#   "prompt-toolkit>=3.0,<4",
+#   "rich>=13,<15",
+# ]
+# ///
 """Read ChatGPT web conversations through a Chrome-authenticated HTTP client."""
 
 from __future__ import annotations
@@ -916,6 +924,53 @@ def run_picker(socket_path: Path) -> int:
             return 0
 
 
+def run_fullscreen(
+    socket_path: Path,
+    conversation_id: str | None = None,
+) -> int:
+    try:
+        from chatgpt_tui import run_tui
+    except ImportError as error:
+        raise ChatGPTWebError(
+            "fullscreen UI dependencies are missing; install chatgpt-web/requirements.txt"
+        ) from error
+
+    initial: dict[str, Any] | None = None
+    if conversation_id:
+        raw = daemon_request(socket_path, {
+            "command": "show", "conversation_id": conversation_id,
+        }).get("conversation", {})
+        if isinstance(raw, dict):
+            initial = normalize_conversation(raw)
+
+    def load(selected_id: str) -> dict[str, Any]:
+        raw = daemon_request(socket_path, {
+            "command": "show", "conversation_id": selected_id,
+        }).get("conversation", {})
+        return normalize_conversation(raw if isinstance(raw, dict) else {})
+
+    def send(
+        selected_id: str | None,
+        prompt: str,
+        on_event: Any,
+        on_connection: Any,
+    ) -> dict[str, Any]:
+        return daemon_stream_request(socket_path, {
+            "command": "send_stream",
+            "conversation_id": selected_id,
+            "prompt": prompt,
+        }, on_event, on_connection)
+
+    run_tui(
+        load,
+        send,
+        conversation_id,
+        conversation_title(initial or {}),
+        (initial or {}).get("messages", []),
+    )
+    return 0
+
+
 def receive_json(connection: socket.socket) -> dict[str, Any]:
     chunks: list[bytes] = []
     size = 0
@@ -970,12 +1025,15 @@ def daemon_stream_request(
     socket_path: Path,
     request: dict[str, Any],
     on_event: Any,
+    on_connection: Any = None,
 ) -> dict[str, Any]:
     connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     connection.settimeout(330)
     result: dict[str, Any] | None = None
     try:
         connection.connect(str(socket_path))
+        if on_connection is not None:
+            on_connection(connection)
         send_json(connection, request)
         connection.shutdown(socket.SHUT_WR)
         stream = connection.makefile("r", encoding="utf-8")
@@ -988,6 +1046,8 @@ def daemon_stream_request(
             elif "result" in message:
                 result = message["result"]
     finally:
+        if on_connection is not None:
+            on_connection(None)
         connection.close()
     if not isinstance(result, dict):
         raise ChatGPTWebError("daemon stream ended without a result")
@@ -1321,7 +1381,7 @@ def main() -> int:
                 raise ChatGPTWebError(
                     "interactive mode requires a terminal; use new or send for piped input"
                 )
-            return run_picker(args.socket)
+            return run_fullscreen(args.socket)
         if args.command == "auth":
             result = daemon_request(
                 args.socket, {"command": "auth", "refresh": args.refresh}
@@ -1359,11 +1419,7 @@ def main() -> int:
             if args.command == "new" and args.output == "text":
                 print(f"\n[conversation {result.get('conversation_id')}]", file=sys.stderr)
         elif args.command == "resume":
-            conversation_id = args.conversation_id
-            conversation = daemon_request(args.socket, {
-                "command": "show", "conversation_id": conversation_id,
-            }).get("conversation", {})
-            run_repl(args.socket, conversation_id, conversation_title(conversation))
+            return run_fullscreen(args.socket, args.conversation_id)
 
     except KeyboardInterrupt:
         print("\n[interrupted]", file=sys.stderr)

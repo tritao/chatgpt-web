@@ -13,12 +13,16 @@ application changes.
 - Python 3.10 or newer
 - `httpx`
 - Node.js 22 or newer
-- Chrome started with remote debugging enabled
+- Chrome or Chromium for the initial interactive login
+
+The installed launcher prefers `uv` and reads the PEP 723 dependency metadata
+from the executable, creating and caching an isolated environment automatically.
+Install manually with `pip install -r requirements.txt` when `uv` is unavailable.
 
 Launch Chrome with a dedicated persistent profile:
 
 ```sh
-./chatgpt-web/chatgpt-web login
+./chatgpt-web/run login
 ```
 
 The equivalent manual command is:
@@ -41,23 +45,26 @@ closed while the daemon remains running. Use:
 
 ```sh
 chatgpt-web
-./chatgpt-web/chatgpt-web auth
-./chatgpt-web/chatgpt-web list
-./chatgpt-web/chatgpt-web list --limit 100
-./chatgpt-web/chatgpt-web list --all --output jsonl
-./chatgpt-web/chatgpt-web show CONVERSATION_ID
-./chatgpt-web/chatgpt-web show CONVERSATION_ID --output jsonl
-./chatgpt-web/chatgpt-web new "Explain monads in one paragraph"
-./chatgpt-web/chatgpt-web send CONVERSATION_ID "Continue, with an example"
-./chatgpt-web/chatgpt-web resume CONVERSATION_ID
-./chatgpt-web/chatgpt-web status
-./chatgpt-web/chatgpt-web logout
+./chatgpt-web/run auth
+./chatgpt-web/run list
+./chatgpt-web/run list --limit 100
+./chatgpt-web/run list --all --output jsonl
+./chatgpt-web/run show CONVERSATION_ID
+./chatgpt-web/run show CONVERSATION_ID --output jsonl
+./chatgpt-web/run new "Explain monads in one paragraph"
+./chatgpt-web/run send CONVERSATION_ID "Continue, with an example"
+./chatgpt-web/run resume CONVERSATION_ID
+./chatgpt-web/run status
+./chatgpt-web/run logout
 ```
 
-Running `chatgpt-web` without a subcommand opens the terminal conversation
-picker. Select a recent chat by number, press `n` for a new conversation, or
-press `/` to filter titles. The interactive prompt supports `/new`, `/list`,
-`/history`, `/help`, and `/exit`.
+Running `chatgpt-web` without a subcommand opens a fullscreen terminal client
+with a scrollable, syntax-highlighted Markdown transcript and a multiline
+prompt fixed to the bottom. Enter submits, Alt+Enter inserts a newline, Ctrl+C
+stops an active response, Ctrl+D exits from an empty prompt, and PageUp/PageDown
+scroll the transcript. Commands include `/new`, `/resume ID`, `/history`,
+`/clear`, `/help`, and `/exit`. `chatgpt-web resume CONVERSATION_ID` opens an
+existing conversation directly in the fullscreen client.
 
 Set `CHATGPT_WEB_CDP_URL` or pass `--cdp-url` when Chrome uses another local
 debugging port.
