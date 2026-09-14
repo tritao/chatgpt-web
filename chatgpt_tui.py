@@ -319,6 +319,9 @@ class ChatTui:
         self.committed_message_count = 0
         self.history_tail = ""
         self.event_loop: asyncio.AbstractEventLoop | None = None
+        self.last_terminal_size: tuple[int, int] | None = None
+        self.resize_reflowing = False
+        self.resize_reflow_pending = False
 
         self.transcript_control = FormattedTextControl(
             text=self.render_formatted_transcript,
@@ -423,6 +426,7 @@ class ChatTui:
             min_redraw_interval=0.05,
             max_render_postpone_time=0.1,
             refresh_interval=0.12,
+            before_render=self.detect_terminal_resize,
             style=Style.from_dict({
                 "separator": "#6b7280",
                 "activity": "#9ca3af",
@@ -551,6 +555,56 @@ class ChatTui:
             return max(40, self.app.output.get_size().columns - 3)
         except Exception:
             return max(40, shutil.get_terminal_size((100, 24)).columns - 3)
+
+    def detect_terminal_resize(self, _app: Application[Any]) -> None:
+        """Replay committed history when terminal dimensions change."""
+        try:
+            size = self.app.output.get_size()
+            current = (size.columns, size.rows)
+        except Exception:
+            fallback = shutil.get_terminal_size((100, 24))
+            current = (fallback.columns, fallback.lines)
+        if self.last_terminal_size is None:
+            self.last_terminal_size = current
+            return
+        if current == self.last_terminal_size:
+            return
+        self.last_terminal_size = current
+        if self.resize_reflowing:
+            self.resize_reflow_pending = True
+            return
+        if self.event_loop is not None:
+            self.event_loop.call_soon(self.reflow_committed_history)
+
+    def reflow_committed_history(self) -> None:
+        if self.resize_reflowing:
+            self.resize_reflow_pending = True
+            return
+        self.resize_reflowing = True
+        with self.lock:
+            completed = [
+                dict(message)
+                for message in self.messages[:self.committed_message_count]
+            ]
+        rendered = self.render_history(completed) if completed else ""
+        committed = self.partition_history(rendered)
+        self.formatted_transcript_source = ""
+
+        def replay() -> None:
+            self.reset_terminal_session()
+            self.write_terminal_history(committed)
+
+        future = run_in_terminal(replay, render_cli_done=False)
+
+        def finished(_future: Any) -> None:
+            self.resize_reflowing = False
+            self.scroll_bottom()
+            if self.resize_reflow_pending:
+                self.resize_reflow_pending = False
+                if self.event_loop is not None:
+                    self.event_loop.call_soon(self.reflow_committed_history)
+
+        future.add_done_callback(finished)
 
     def render_history(self, messages: list[Message]) -> str:
         width = self.transcript_width()

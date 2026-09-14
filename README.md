@@ -26,6 +26,7 @@ home beside modern coding agents.
 - 🎨 **Rich Markdown** with syntax-highlighted fenced code blocks
 - 🖼️ **Clipboard images** uploaded and attached directly from the composer
 - 📜 **Native terminal scrollback** bounded to the current session
+- ↔️ **Resize-aware history** that reflows completed turns to the new width
 - 🧹 **Clean history rendering** that hides internal tool-protocol payloads
 - 📋 **Clipboard support** through `/copy`
 - 🪶 **Zero manual environment setup** when launched with `uv`
