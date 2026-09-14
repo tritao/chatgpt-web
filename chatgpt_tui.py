@@ -198,6 +198,26 @@ def render_chatgpt_annotations(text: str) -> str:
     return rendered
 
 
+def visible_chat_message(message: dict[str, Any]) -> Message | None:
+    """Return user-facing turns while excluding web tool protocol nodes."""
+    role = message.get("role")
+    text = message.get("text")
+    content_type = message.get("content_type")
+    if role == "user":
+        visible = content_type in (None, "text")
+    elif role == "assistant":
+        visible = (
+            content_type in (None, "text")
+            and message.get("channel") in (None, "commentary", "final")
+            and message.get("recipient") in (None, "all")
+        )
+    else:
+        visible = False
+    if not visible or not isinstance(text, str) or not text:
+        return None
+    return {"role": role, "text": text}
+
+
 class ChatTui:
     def __init__(
         self,
@@ -217,10 +237,9 @@ class ChatTui:
         self.model = model or os.environ.get("CHATGPT_WEB_MODEL", "gpt-5-6-thinking")
         self.messages: list[Message] = []
         for message in initial_messages or []:
-            role = message.get("role")
-            text = message.get("text")
-            if isinstance(role, str) and isinstance(text, str) and text:
-                self.messages.append({"role": role, "text": text})
+            visible = visible_chat_message(message)
+            if visible is not None:
+                self.messages.append(visible)
         self.busy = False
         self.status = "Ready"
         self.cancel_connection: Any = None
@@ -912,9 +931,9 @@ class ChatTui:
                 conversation = self.load_conversation(conversation_id)
                 messages = []
                 for message in conversation.get("messages", []):
-                    role, text = message.get("role"), message.get("text")
-                    if isinstance(role, str) and isinstance(text, str) and text:
-                        messages.append({"role": role, "text": text})
+                    visible = visible_chat_message(message)
+                    if visible is not None:
+                        messages.append(visible)
                 with self.lock:
                     self.messages = messages
                 self.conversation_id = conversation_id
