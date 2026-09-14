@@ -12,7 +12,6 @@ from datetime import datetime
 from typing import Any, Callable
 
 from prompt_toolkit.application import Application
-from prompt_toolkit.auto_suggest import AutoSuggest, Suggestion
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.formatted_text import ANSI, FormattedText
@@ -22,6 +21,7 @@ from prompt_toolkit.layout.containers import ConditionalContainer
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.layout.dimension import D
 from prompt_toolkit.layout.menus import CompletionsMenu
+from prompt_toolkit.layout.processors import Processor, Transformation
 from prompt_toolkit.styles import Style
 from prompt_toolkit.data_structures import Point
 from prompt_toolkit.widgets import Frame, TextArea
@@ -67,11 +67,16 @@ class SlashCommandCompleter(Completer):
                 )
 
 
-class ComposerPlaceholder(AutoSuggest):
-    def get_suggestion(self, buffer: Any, document: Any) -> Suggestion | None:
-        if not document.text:
-            return Suggestion("Ask ChatGPT anything")
-        return None
+class ComposerPlaceholderProcessor(Processor):
+    def apply_transformation(self, transformation_input: Any) -> Transformation:
+        fragments = transformation_input.fragments
+        if transformation_input.document.text or transformation_input.lineno != 0:
+            return Transformation(fragments)
+        return Transformation(
+            fragments + [("class:placeholder", "Ask ChatGPT anything")],
+            source_to_display=lambda position: position,
+            display_to_source=lambda position: 0,
+        )
 
 
 def render_chatgpt_annotations(text: str) -> str:
@@ -164,7 +169,7 @@ class ChatTui:
             dont_extend_height=True,
             completer=SlashCommandCompleter(),
             complete_while_typing=True,
-            auto_suggest=ComposerPlaceholder(),
+            input_processors=[ComposerPlaceholderProcessor()],
             style="class:composer",
         )
         self.resume_search = TextArea(
@@ -247,7 +252,7 @@ class ChatTui:
                 "activity": "#9ca3af",
                 "composer": "bg:#4b4b4b #f9fafb",
                 "prompt": "bg:#4b4b4b bold #f9fafb",
-                "auto-suggestion": "bg:#4b4b4b #9ca3af",
+                "placeholder": "bg:#4b4b4b #9ca3af",
                 "metadata": "bg:#272727 #9ca3af",
                 "metadata.model": "bg:#272727 #fbbf24",
                 "metadata.ready": "bg:#272727 #86efac",
