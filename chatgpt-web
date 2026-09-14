@@ -1045,9 +1045,9 @@ def run_fullscreen(
 
     def load(selected_id: str) -> dict[str, Any]:
         raw = daemon_request(socket_path, {
-            "command": "show", "conversation_id": selected_id,
+            "command": "show_normalized", "conversation_id": selected_id,
         }).get("conversation", {})
-        return normalize_conversation(raw if isinstance(raw, dict) else {})
+        return raw if isinstance(raw, dict) else {}
 
     def send(
         selected_id: str | None,
@@ -1086,7 +1086,10 @@ def run_fullscreen(
     return 0
 
 
-def receive_json(connection: socket.socket) -> dict[str, Any]:
+def receive_json(
+    connection: socket.socket,
+    maximum: int | None = MAX_DAEMON_MESSAGE,
+) -> dict[str, Any]:
     chunks: list[bytes] = []
     size = 0
     while True:
@@ -1095,7 +1098,7 @@ def receive_json(connection: socket.socket) -> dict[str, Any]:
             break
         chunks.append(chunk)
         size += len(chunk)
-        if size > MAX_DAEMON_MESSAGE:
+        if maximum is not None and size > maximum:
             raise ChatGPTWebError("daemon message exceeded the size limit")
     try:
         value = json.loads(b"".join(chunks))
@@ -1125,7 +1128,9 @@ def daemon_request(socket_path: Path, request: dict[str, Any]) -> dict[str, Any]
         connection.connect(str(socket_path))
         send_json(connection, request)
         connection.shutdown(socket.SHUT_WR)
-        response = receive_json(connection)
+        # Conversation history can legitimately exceed the command-size limit.
+        # The daemon is local and trusted; only cap requests entering it.
+        response = receive_json(connection, maximum=None)
     finally:
         connection.close()
     if not response.get("ok"):
@@ -1307,6 +1312,15 @@ def handle_daemon_command(
         if not isinstance(conversation_id, str) or not conversation_id:
             raise ChatGPTWebError("conversation ID is required")
         return {"conversation": client.get_conversation(conversation_id)}, False
+    if command == "show_normalized":
+        conversation_id = request.get("conversation_id")
+        if not isinstance(conversation_id, str) or not conversation_id:
+            raise ChatGPTWebError("conversation ID is required")
+        return {
+            "conversation": normalize_conversation(
+                client.get_conversation(conversation_id)
+            )
+        }, False
     if command == "send":
         conversation_id = request.get("conversation_id")
         prompt = request.get("prompt")
