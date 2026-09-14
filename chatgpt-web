@@ -1,0 +1,1378 @@
+#!/usr/bin/env python3
+"""Read ChatGPT web conversations through a Chrome-authenticated HTTP client."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+from http.cookies import SimpleCookie
+import json
+import os
+from pathlib import Path
+import signal
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import uuid
+from datetime import datetime
+from typing import Any, Iterable
+from urllib.parse import urljoin, urlsplit
+
+import httpx
+
+
+DEFAULT_CDP_URL = "http://127.0.0.1:9222"
+DEFAULT_PAGE_SIZE = 28
+CHATGPT_ORIGIN = "https://chatgpt.com"
+MAX_DAEMON_MESSAGE = 64 * 1024 * 1024
+FORBIDDEN_REPLAY_HEADERS = {
+    "host", "content-length", "connection", ":authority", ":method",
+    ":path", ":scheme", "x-openai-target-path", "x-openai-target-route",
+}
+
+
+class ChatGPTWebError(RuntimeError):
+    pass
+
+
+class SentinelCompatibilityError(ChatGPTWebError):
+    pass
+
+
+def default_socket_path() -> Path:
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    base = Path(runtime) if runtime else Path("/tmp") / f"chatgpt-web-{os.getuid()}"
+    return base / "chatgpt-web" / "daemon.sock" if runtime else base / "daemon.sock"
+
+
+def auth_store_path() -> Path:
+    state_home = os.environ.get("XDG_STATE_HOME")
+    root = Path(state_home) if state_home else Path.home() / ".local" / "state"
+    return root / "chatgpt-web" / "session.json"
+
+
+def sentinel_cache_status() -> dict[str, Any] | None:
+    cache_home = os.environ.get("XDG_CACHE_HOME")
+    root = Path(cache_home) if cache_home else Path.home() / ".cache"
+    manifest = root / "chatgpt-web" / "sentinel" / "current.json"
+    try:
+        value = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    digest = value.get("sha256")
+    implementation = value.get("implementation")
+    checked_at = value.get("checked_at")
+    if not isinstance(digest, str) or not isinstance(implementation, str):
+        return None
+    return {
+        "implementation": implementation,
+        "sha256": digest,
+        "checked_at": checked_at if isinstance(checked_at, int) else None,
+    }
+
+
+def save_auth_snapshot(url: str, headers: dict[str, str]) -> None:
+    path = auth_store_path()
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    temporary = path.with_suffix(f".tmp-{os.getpid()}")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump({"version": 1, "url": url, "headers": headers}, stream)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def load_auth_snapshot() -> tuple[str, dict[str, str]]:
+    path = auth_store_path()
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        url = value["url"]
+        headers = value["headers"]
+    except FileNotFoundError as error:
+        raise ChatGPTWebError("no saved session; run chatgpt-web login") from error
+    except (KeyError, TypeError, json.JSONDecodeError, OSError) as error:
+        raise ChatGPTWebError("saved ChatGPT session is invalid") from error
+    parsed = urlsplit(url)
+    if parsed.scheme != "https" or parsed.netloc != "chatgpt.com":
+        raise ChatGPTWebError("saved ChatGPT session has an invalid origin")
+    if not isinstance(headers, dict) or not all(
+        isinstance(key, str) and isinstance(item, str)
+        for key, item in headers.items()
+    ):
+        raise ChatGPTWebError("saved ChatGPT session has invalid headers")
+    return url, {key.lower(): value for key, value in headers.items()}
+
+
+def capture_auth(cdp_url: str) -> tuple[str, dict[str, str]]:
+    helper = Path(__file__).with_name("chrome-auth.js")
+    environment = os.environ.copy()
+    environment["CHATGPT_WEB_CDP_URL"] = cdp_url.rstrip("/")
+    try:
+        result = subprocess.run(
+            ["node", str(helper)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=20,
+            check=False,
+            env=environment,
+        )
+    except FileNotFoundError as error:
+        raise ChatGPTWebError("Node.js 22 or newer is required for Chrome authentication") from error
+    except subprocess.TimeoutExpired as error:
+        raise ChatGPTWebError("Chrome authentication capture timed out") from error
+
+    if result.returncode != 0:
+        detail = result.stderr.strip() or "Chrome authentication capture failed"
+        raise ChatGPTWebError(detail)
+    try:
+        captured = json.loads(result.stdout)
+        url = captured["url"]
+        headers = {
+            key.lower(): value for key, value in captured["headers"].items()
+            if key.lower() not in FORBIDDEN_REPLAY_HEADERS
+        }
+    except (KeyError, TypeError, json.JSONDecodeError) as error:
+        raise ChatGPTWebError("Chrome returned an invalid authentication snapshot") from error
+    return url, headers
+
+
+class ChatGPTWebClient:
+    def __init__(self, cdp_url: str) -> None:
+        self.cdp_url = cdp_url
+        self.list_url = ""
+        self.headers: dict[str, str] = {}
+        self.http = httpx.Client(
+            follow_redirects=False,
+            timeout=httpx.Timeout(30.0),
+        )
+        self.refresh_auth(prefer_browser=True)
+
+    def close(self) -> None:
+        self.http.close()
+
+    def __enter__(self) -> "ChatGPTWebClient":
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
+
+    def refresh_auth(self, prefer_browser: bool = False) -> None:
+        if prefer_browser and chrome_is_ready(self.cdp_url):
+            self.list_url, self.headers = capture_auth(self.cdp_url)
+            save_auth_snapshot(self.list_url, self.headers)
+            return
+        try:
+            self.list_url, self.headers = load_auth_snapshot()
+        except ChatGPTWebError:
+            if not chrome_is_ready(self.cdp_url):
+                raise
+            self.list_url, self.headers = capture_auth(self.cdp_url)
+            save_auth_snapshot(self.list_url, self.headers)
+
+    def refresh_session(self) -> None:
+        headers = self.headers.copy()
+        headers.pop("authorization", None)
+        response = self.http.get(
+            urljoin(CHATGPT_ORIGIN, "/api/auth/session"),
+            headers=headers,
+            timeout=30,
+        )
+        if response.status_code != 200:
+            raise ChatGPTWebError(
+                "saved session expired; run chatgpt-web login"
+            )
+        try:
+            value = response.json()
+            token = value.get("accessToken")
+        except (ValueError, AttributeError) as error:
+            raise ChatGPTWebError("ChatGPT session refresh returned invalid data") from error
+        if not isinstance(token, str) or not token:
+            raise ChatGPTWebError("saved session expired; run chatgpt-web login")
+        self.headers["authorization"] = f"Bearer {token}"
+        cookie_header = self.headers.get("cookie", "")
+        cookies = SimpleCookie()
+        cookies.load(cookie_header)
+        for cookie in response.cookies.jar:
+            cookies[cookie.name] = cookie.value
+        self.headers["cookie"] = "; ".join(
+            f"{name}={morsel.value}" for name, morsel in cookies.items()
+        )
+        save_auth_snapshot(self.list_url, self.headers)
+
+    def request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
+        for attempt in range(2):
+            request_headers = self.headers.copy()
+            target_path = urlsplit(url).path
+            request_headers["x-openai-target-path"] = target_path
+            request_headers["x-openai-target-route"] = target_path
+            response = self.http.request(method, url, headers=request_headers, **kwargs)
+            if response.status_code not in (401, 403) or attempt == 1:
+                break
+            try:
+                self.refresh_session()
+            except ChatGPTWebError:
+                if not chrome_is_ready(self.cdp_url):
+                    raise
+                self.list_url, self.headers = capture_auth(self.cdp_url)
+                save_auth_snapshot(self.list_url, self.headers)
+        if response.status_code == 429:
+            retry_after = response.headers.get("retry-after")
+            suffix = f"; retry after {retry_after} seconds" if retry_after else ""
+            raise ChatGPTWebError(f"ChatGPT web rate limit reached{suffix}")
+        if response.status_code >= 400:
+            raise ChatGPTWebError(
+                f"ChatGPT returned HTTP {response.status_code} for {method} {response.url.path}"
+            )
+        content_type = response.headers.get("content-type", "")
+        if "application/json" not in content_type:
+            raise ChatGPTWebError(
+                f"ChatGPT returned unexpected content type {content_type or '<missing>'}"
+            )
+        return response
+
+    def verify(self) -> dict[str, Any]:
+        return self.request("GET", self.list_url).json()
+
+    def list_conversations(self, maximum: int | None) -> list[dict[str, Any]]:
+        offset = 0
+        conversations: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        while True:
+            response = self.request(
+                "GET",
+                urljoin(CHATGPT_ORIGIN, "/backend-api/conversations"),
+                params={
+                    "offset": offset,
+                    "limit": DEFAULT_PAGE_SIZE,
+                    "order": "updated",
+                    "is_archived": "false",
+                    "is_starred": "false",
+                },
+            ).json()
+            items = response.get("items", [])
+            if not isinstance(items, list):
+                raise ChatGPTWebError("conversation list did not contain an items array")
+            fresh = [
+                item for item in items
+                if isinstance(item, dict) and item.get("id") not in seen
+            ]
+            conversations.extend(fresh)
+            seen.update(item["id"] for item in fresh if item.get("id"))
+            offset += len(items)
+            if maximum is not None and len(conversations) >= maximum:
+                return conversations[:maximum]
+            # The private endpoint's `total` is a rolling window marker rather
+            # than a stable collection size. A short page (or no new IDs) is
+            # the reliable end condition.
+            if len(items) < DEFAULT_PAGE_SIZE or not fresh:
+                return conversations
+
+    def get_conversation(self, conversation_id: str) -> dict[str, Any]:
+        url = urljoin(
+            CHATGPT_ORIGIN,
+            f"/backend-api/conversations/{conversation_id}",
+        )
+        result = self.request("GET", url).json()
+        if not isinstance(result, dict):
+            raise ChatGPTWebError("conversation response was not an object")
+        return result
+
+    def send_prompt(
+        self,
+        conversation_id: str | None,
+        prompt: str,
+        on_event: Any = None,
+    ) -> tuple[str, dict[str, Any], set[str]]:
+        previous_ids: set[str] = set()
+        previous: dict[str, Any] | None = None
+        if conversation_id:
+            previous = self.get_conversation(conversation_id)
+            previous_messages = previous.get("messages", [])
+            if isinstance(previous_messages, list):
+                previous_ids = {
+                    item["id"] for item in previous_messages
+                    if isinstance(item, dict) and item.get("id")
+                }
+
+        if os.environ.get("CHATGPT_WEB_SEND_MODE", "node") != "chrome":
+            resolved_id = self.send_prompt_direct(previous, prompt, on_event)
+            conversation = self.get_conversation(resolved_id)
+            return resolved_id, conversation, previous_ids
+
+        helper = Path(__file__).with_name("chrome-send.js")
+        environment = os.environ.copy()
+        environment["CHATGPT_WEB_CDP_URL"] = self.cdp_url.rstrip("/")
+        process = None
+        try:
+            process = subprocess.Popen(
+                ["node", str(helper)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                env=environment,
+            )
+            assert process.stdin is not None
+            assert process.stdout is not None
+            process.stdin.write(json.dumps({
+                "conversation_id": conversation_id,
+                "prompt": prompt,
+            }))
+            process.stdin.close()
+            resolved_id = None
+            for line in process.stdout:
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError as error:
+                    raise ChatGPTWebError(
+                        "Chrome returned an invalid stream event"
+                    ) from error
+                if event.get("type") == "completed":
+                    resolved_id = event.get("conversation_id")
+                elif on_event is not None:
+                    on_event(event)
+            return_code = process.wait(timeout=5)
+        except (BrokenPipeError, ConnectionError, OSError):
+            if process is not None and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+            raise
+        except subprocess.TimeoutExpired as error:
+            if process is not None:
+                process.kill()
+            raise ChatGPTWebError("prompt submission timed out") from error
+        if return_code != 0:
+            assert process.stderr is not None
+            detail = process.stderr.read().strip() or "prompt submission failed"
+            raise ChatGPTWebError(detail)
+        if not isinstance(resolved_id, str) or not resolved_id:
+            raise ChatGPTWebError("ChatGPT did not return a conversation ID")
+
+        conversation = self.get_conversation(resolved_id)
+        return resolved_id, conversation, previous_ids
+
+    def send_prompt_direct(
+        self,
+        conversation: dict[str, Any] | None,
+        prompt: str,
+        on_event: Any = None,
+    ) -> str:
+        conversation_id = None
+        if conversation:
+            candidate = conversation.get("conversation_id") or conversation.get("id")
+            if isinstance(candidate, str):
+                conversation_id = candidate
+        mode = os.environ.get("CHATGPT_WEB_SEND_MODE", "node")
+        if mode == "recipe":
+            method, url, headers, body = self.capture_send_recipe(
+                conversation_id, prompt
+            )
+        else:
+            try:
+                sentinel_headers = self.create_sentinel_headers()
+            except SentinelCompatibilityError as error:
+                if not chrome_is_ready(self.cdp_url):
+                    raise ChatGPTWebError(
+                        f"{error}; run chatgpt-web login for compatibility fallback"
+                    ) from error
+                method, url, headers, body = self.capture_send_recipe(
+                    conversation_id, prompt
+                )
+            else:
+                method = "POST"
+                url = urljoin(CHATGPT_ORIGIN, "/backend-api/f/conversation")
+                headers = self.headers.copy()
+                headers.update(sentinel_headers)
+                body = self.create_conversation_body(conversation, prompt)
+
+        headers.pop("x-openai-web-sse-compression", None)
+        headers["x-openai-target-path"] = "/backend-api/f/conversation"
+        headers["x-openai-target-route"] = "/backend-api/f/conversation"
+        body["supported_encodings"] = []
+        body["supports_buffering"] = False
+        resolved_id: str | None = conversation_id
+        rendered = ""
+        with self.http.stream(
+            method,
+            url,
+            headers=headers,
+            json=body,
+            timeout=httpx.Timeout(300.0),
+        ) as response:
+            if response.status_code == 429:
+                retry_after = response.headers.get("retry-after")
+                suffix = f"; retry after {retry_after} seconds" if retry_after else ""
+                raise ChatGPTWebError(f"ChatGPT web rate limit reached{suffix}")
+            if response.status_code >= 400:
+                raise ChatGPTWebError(
+                    f"ChatGPT submission returned HTTP {response.status_code}"
+                )
+            content_type = response.headers.get("content-type", "")
+            if "text/event-stream" not in content_type:
+                raise ChatGPTWebError(
+                    f"ChatGPT returned unexpected content type {content_type or '<missing>'}"
+                )
+            for line in response.iter_lines():
+                if not line.startswith("data: "):
+                    continue
+                payload = line[6:]
+                if payload == "[DONE]":
+                    break
+                try:
+                    event = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                event_id = event.get("conversation_id")
+                if isinstance(event_id, str) and event_id:
+                    resolved_id = event_id
+                message = event.get("message")
+                if not isinstance(message, dict):
+                    continue
+                author = message.get("author")
+                if not isinstance(author, dict) or author.get("role") != "assistant":
+                    continue
+                text = text_from_parts(message_parts(message.get("content")))
+                if not text or text == rendered:
+                    continue
+                if on_event is not None:
+                    if text.startswith(rendered):
+                        on_event({"type": "delta", "text": text[len(rendered):]})
+                    else:
+                        on_event({"type": "replace", "text": text})
+                rendered = text
+        if not isinstance(resolved_id, str) or not resolved_id:
+            raise ChatGPTWebError("ChatGPT did not return a conversation ID")
+        return resolved_id
+
+    def run_sentinel_node(
+        self, arguments: list[str], payload: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        helper = Path(__file__).with_name("sentinel-node-probe.js")
+        environment = os.environ.copy()
+        try:
+            result = subprocess.run(
+                ["node", str(helper), *arguments],
+                input=json.dumps(payload) if payload is not None else None,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=30,
+                check=False,
+                env=environment,
+            )
+        except FileNotFoundError as error:
+            raise SentinelCompatibilityError(
+                "Node.js 22 or newer is required for signing"
+            ) from error
+        except subprocess.TimeoutExpired as error:
+            raise SentinelCompatibilityError("Sentinel signing timed out") from error
+        if result.returncode != 0:
+            detail = result.stderr.strip() or "Sentinel signing failed"
+            raise SentinelCompatibilityError(detail)
+        try:
+            value = json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            raise SentinelCompatibilityError(
+                "Sentinel signer returned invalid JSON"
+            ) from error
+        if not isinstance(value, dict):
+            raise SentinelCompatibilityError(
+                "Sentinel signer returned an invalid result"
+            )
+        return value
+
+    def create_sentinel_headers(self) -> dict[str, str]:
+        initial = self.run_sentinel_node(["--emit-initial"]).get("initial")
+        if not isinstance(initial, str) or not initial:
+            raise SentinelCompatibilityError(
+                "Sentinel signer did not generate an initial proof"
+            )
+        requirements = self.request(
+            "POST",
+            urljoin(CHATGPT_ORIGIN, "/backend-api/sentinel/chat-requirements/prepare"),
+            json={"p": initial},
+        ).json()
+        if not isinstance(requirements, dict):
+            raise ChatGPTWebError("Sentinel prepare returned an invalid response")
+        enforcement = self.run_sentinel_node(
+            ["--requirements-stdin", "--emit-enforcement-json"], requirements
+        )
+        prepare_token = requirements.get("prepare_token")
+        proof = enforcement.get("proof")
+        turnstile = enforcement.get("turnstile")
+        if not isinstance(prepare_token, str) or not isinstance(proof, str):
+            raise SentinelCompatibilityError(
+                "Sentinel did not return required enforcement tokens"
+            )
+        result = {
+            "openai-sentinel-chat-requirements-prepare-token": prepare_token,
+            "openai-sentinel-proof-token": proof,
+        }
+        if isinstance(turnstile, str) and turnstile:
+            result["openai-sentinel-turnstile-token"] = turnstile
+        return result
+
+    def create_conversation_body(
+        self, conversation: dict[str, Any] | None, prompt: str
+    ) -> dict[str, Any]:
+        parent = conversation.get("current_node") if conversation else None
+        if not isinstance(parent, str) or not parent:
+            parent = str(uuid.uuid4())
+        now = datetime.now().astimezone()
+        offset = now.utcoffset()
+        offset_minutes = -int(offset.total_seconds() / 60) if offset else 0
+        model = os.environ.get("CHATGPT_WEB_MODEL")
+        if not model and conversation:
+            candidate = conversation.get("default_model_slug")
+            if isinstance(candidate, str) and candidate:
+                model = candidate
+        return {
+            "action": "next",
+            "messages": [{
+                "id": str(uuid.uuid4()),
+                "author": {"role": "user"},
+                "create_time": time.time(),
+                "content": {"content_type": "text", "parts": [prompt]},
+                "metadata": {
+                    "selected_sources": [],
+                    "serialization_metadata": {"custom_symbol_offsets": []},
+                    "submission_mode": "manual_send",
+                },
+            }],
+            "parent_message_id": parent,
+            "model": model or "gpt-5-6-thinking",
+            "client_prepare_state": "sent",
+            "timezone_offset_min": offset_minutes,
+            "timezone": os.environ.get("TZ", "Europe/Lisbon"),
+            "conversation_mode": {"kind": "primary_assistant"},
+            "enable_message_followups": True,
+            "system_hints": [],
+            "supports_buffering": False,
+            "supported_encodings": [],
+            "paragen_cot_summary_display_override": "allow",
+            "force_parallel_switch": "auto",
+            "thinking_effort": "extended",
+            "local_function_names": ["local.continue_in_work"],
+        }
+
+    def capture_send_recipe(
+        self, conversation_id: str | None, prompt: str
+    ) -> tuple[str, str, dict[str, str], dict[str, Any]]:
+        helper = Path(__file__).with_name("chrome-recipe.js")
+        environment = os.environ.copy()
+        environment["CHATGPT_WEB_CDP_URL"] = self.cdp_url.rstrip("/")
+        try:
+            captured = subprocess.run(
+                ["node", str(helper)],
+                input=json.dumps({"conversation_id": conversation_id, "prompt": prompt}),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=45,
+                check=False,
+                env=environment,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as error:
+            raise ChatGPTWebError("Chrome request preparation failed") from error
+        if captured.returncode != 0:
+            raise ChatGPTWebError(captured.stderr.strip() or "request preparation failed")
+        try:
+            recipe = json.loads(captured.stdout)
+            url = recipe["url"]
+            method = recipe["method"]
+            body = json.loads(recipe["postData"])
+            headers = {
+                key.lower(): value for key, value in recipe["headers"].items()
+                if key.lower() not in FORBIDDEN_REPLAY_HEADERS and not key.startswith(":")
+            }
+        except (KeyError, TypeError, json.JSONDecodeError) as error:
+            raise ChatGPTWebError("Chrome returned an invalid send recipe") from error
+        parsed = urlsplit(url)
+        if (parsed.scheme, parsed.netloc, parsed.path) != (
+            "https", "chatgpt.com", "/backend-api/f/conversation"
+        ) or method != "POST":
+            raise ChatGPTWebError("Chrome returned an unexpected send destination")
+        return method, url, headers, body
+
+
+def message_parts(content: Any) -> list[Any]:
+    if not isinstance(content, dict):
+        return []
+    parts = content.get("parts", [])
+    return parts if isinstance(parts, list) else []
+
+
+def text_from_parts(parts: Iterable[Any]) -> str:
+    rendered: list[str] = []
+    for part in parts:
+        if isinstance(part, str):
+            rendered.append(part)
+        elif isinstance(part, dict):
+            text = part.get("text")
+            if isinstance(text, str):
+                rendered.append(text)
+            else:
+                rendered.append(json.dumps(part, ensure_ascii=False, sort_keys=True))
+        elif part is not None:
+            rendered.append(str(part))
+    return "\n".join(rendered)
+
+
+def normalize_message(message: dict[str, Any]) -> dict[str, Any]:
+    author = message.get("author")
+    author = author if isinstance(author, dict) else {}
+    content = message.get("content")
+    content = content if isinstance(content, dict) else {}
+    parts = message_parts(content)
+    return {
+        "id": message.get("id"),
+        "role": author.get("role"),
+        "name": author.get("name"),
+        "channel": message.get("channel"),
+        "recipient": message.get("recipient"),
+        "status": message.get("status"),
+        "create_time": message.get("create_time"),
+        "update_time": message.get("update_time"),
+        "content_type": content.get("content_type"),
+        "parts": parts,
+        "text": text_from_parts(parts),
+    }
+
+
+def normalize_conversation(conversation: dict[str, Any]) -> dict[str, Any]:
+    raw_messages = conversation.get("messages", [])
+    messages = raw_messages if isinstance(raw_messages, list) else []
+    return {
+        "id": conversation.get("conversation_id") or conversation.get("id"),
+        "title": conversation.get("title"),
+        "create_time": conversation.get("create_time"),
+        "update_time": conversation.get("update_time"),
+        "current_node": conversation.get("current_node"),
+        "model": conversation.get("default_model_slug"),
+        "messages": [normalize_message(item) for item in messages if isinstance(item, dict)],
+        "page_info": conversation.get("page_info"),
+    }
+
+
+def print_conversation_list(items: list[dict[str, Any]], output: str) -> None:
+    if output == "json":
+        print(json.dumps(items, ensure_ascii=False, indent=2))
+    elif output == "jsonl":
+        for item in items:
+            print(json.dumps(item, ensure_ascii=False, separators=(",", ":")))
+    else:
+        for item in items:
+            print(f"{item.get('id', '')}\t{item.get('title') or 'Untitled'}")
+
+
+def print_conversation(conversation: dict[str, Any], output: str) -> None:
+    normalized = normalize_conversation(conversation)
+    if output == "json":
+        print(json.dumps(normalized, ensure_ascii=False, indent=2))
+    elif output == "jsonl":
+        envelope = {key: value for key, value in normalized.items() if key != "messages"}
+        envelope["type"] = "conversation"
+        print(json.dumps(envelope, ensure_ascii=False, separators=(",", ":")))
+        for message in normalized["messages"]:
+            print(json.dumps(
+                {"type": "message", **message},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ))
+    else:
+        print(f"# {normalized.get('title') or 'Untitled'}")
+        for message in normalized["messages"]:
+            text = message.get("text", "")
+            if not text:
+                continue
+            role = message.get("role") or "unknown"
+            name = message.get("name")
+            heading = f"{role} ({name})" if name else role
+            print(f"\n## {heading}\n\n{text}")
+
+
+def new_messages(
+    conversation: dict[str, Any], previous_ids: set[str]
+) -> list[dict[str, Any]]:
+    raw = conversation.get("messages", [])
+    if not isinstance(raw, list):
+        return []
+    return [
+        normalize_message(item) for item in raw
+        if isinstance(item, dict) and item.get("id") not in previous_ids
+    ]
+
+
+def print_prompt_result(result: dict[str, Any], output: str) -> None:
+    messages = new_messages(
+        result.get("conversation", {}), set(result.get("previous_ids", []))
+    )
+    if output == "json":
+        print(json.dumps({
+            "conversation_id": result.get("conversation_id"),
+            "messages": messages,
+        }, ensure_ascii=False, indent=2))
+        return
+    if output == "jsonl":
+        for message in messages:
+            print(json.dumps(
+                {"type": "message", **message}, ensure_ascii=False,
+                separators=(",", ":"),
+            ))
+        return
+    for message in messages:
+        if message.get("role") != "assistant" or not message.get("text"):
+            continue
+        print(message["text"])
+
+
+def stream_prompt(
+    socket_path: Path,
+    conversation_id: str | None,
+    prompt: str,
+    output: str,
+) -> dict[str, Any]:
+    rendered = ""
+
+    def on_event(event: dict[str, Any]) -> None:
+        nonlocal rendered
+        event_type = event.get("type")
+        if output == "jsonl" and event_type != "heartbeat":
+            print(json.dumps(event, ensure_ascii=False, separators=(",", ":")),
+                  flush=True)
+        if output != "text":
+            return
+        if event_type == "delta":
+            text = event.get("text", "")
+            if isinstance(text, str):
+                print(text, end="", flush=True)
+                rendered += text
+        elif event_type == "replace":
+            text = event.get("text", "")
+            if isinstance(text, str):
+                print(("\n" if rendered else "") + text, end="", flush=True)
+                rendered = text
+
+    result = daemon_stream_request(socket_path, {
+        "command": "send_stream",
+        "conversation_id": conversation_id,
+        "prompt": prompt,
+    }, on_event)
+
+    if output == "text":
+        messages = new_messages(
+            result.get("conversation", {}), set(result.get("previous_ids", []))
+        )
+        final = "\n".join(
+            message.get("text", "") for message in messages
+            if message.get("role") == "assistant" and message.get("text")
+        )
+        if final.startswith(rendered):
+            print(final[len(rendered):], end="")
+        elif not rendered:
+            print(final, end="")
+        elif final and final != rendered:
+            print(f"\n{final}", end="")
+        print()
+    else:
+        print_prompt_result(result, output)
+    return result
+
+
+def conversation_title(conversation: dict[str, Any]) -> str:
+    title = conversation.get("title")
+    return title if isinstance(title, str) and title.strip() else "Untitled"
+
+
+def format_timestamp(value: Any) -> str:
+    if not isinstance(value, (int, float)):
+        return ""
+    try:
+        return datetime.fromtimestamp(value).strftime("%Y-%m-%d %H:%M")
+    except (OverflowError, OSError, ValueError):
+        return ""
+
+
+def choose_conversation(socket_path: Path) -> tuple[str | None, str] | None:
+    result = daemon_request(socket_path, {"command": "list", "maximum": 30})
+    all_items = result.get("items", [])
+    if not isinstance(all_items, list):
+        all_items = []
+    items = all_items
+    while True:
+        print("\nRecent conversations\n")
+        for index, item in enumerate(items, 1):
+            stamp = format_timestamp(item.get("update_time"))
+            suffix = f"  {stamp}" if stamp else ""
+            print(f"{index:>2}. {conversation_title(item)}{suffix}")
+        print("\n[n] New conversation   [/] Search   [q] Quit")
+        try:
+            choice = input("Select: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        if choice.lower() in ("q", "/exit", "/quit"):
+            return None
+        if choice.lower() in ("n", "/new"):
+            return None, "New conversation"
+        if choice == "/":
+            query = input("Search titles: ").strip().casefold()
+            items = [
+                item for item in all_items
+                if query in conversation_title(item).casefold()
+            ]
+            continue
+        try:
+            selected = items[int(choice) - 1]
+        except (ValueError, IndexError):
+            print("Choose a listed number, n, /, or q.")
+            continue
+        conversation_id = selected.get("id")
+        if isinstance(conversation_id, str) and conversation_id:
+            return conversation_id, conversation_title(selected)
+
+
+def run_repl(
+    socket_path: Path,
+    conversation_id: str | None,
+    title: str,
+) -> str:
+    print(f"\nChatGPT Web · {title}")
+    print("Type /help for commands. Ctrl+C stops a response.\n")
+    while True:
+        try:
+            prompt = input("❯ ").strip()
+        except EOFError:
+            print()
+            return "exit"
+        except KeyboardInterrupt:
+            print()
+            continue
+        if not prompt:
+            continue
+        if prompt in ("/exit", "/quit"):
+            return "exit"
+        if prompt == "/list":
+            return "list"
+        if prompt == "/new":
+            conversation_id = None
+            title = "New conversation"
+            print("Started a new conversation.")
+            continue
+        if prompt == "/help":
+            print("/new      start a new conversation")
+            print("/list     return to the conversation picker")
+            print("/history  print the current conversation")
+            print("/exit     leave chatgpt-web")
+            continue
+        if prompt == "/history":
+            if conversation_id is None:
+                print("This conversation has no messages yet.")
+                continue
+            conversation = daemon_request(socket_path, {
+                "command": "show", "conversation_id": conversation_id,
+            }).get("conversation", {})
+            print_conversation(conversation, "markdown")
+            continue
+        if prompt.startswith("/"):
+            print(f"Unknown command: {prompt}. Type /help.")
+            continue
+        try:
+            result = stream_prompt(socket_path, conversation_id, prompt, "text")
+        except KeyboardInterrupt:
+            print("\n[interrupted]", file=sys.stderr)
+            continue
+        previous_id = conversation_id
+        conversation_id = result.get("conversation_id", conversation_id)
+        if previous_id is None and conversation_id:
+            print(f"[conversation {conversation_id}]", file=sys.stderr)
+
+
+def run_picker(socket_path: Path) -> int:
+    while True:
+        selected = choose_conversation(socket_path)
+        if selected is None:
+            return 0
+        conversation_id, title = selected
+        if run_repl(socket_path, conversation_id, title) == "exit":
+            return 0
+
+
+def receive_json(connection: socket.socket) -> dict[str, Any]:
+    chunks: list[bytes] = []
+    size = 0
+    while True:
+        chunk = connection.recv(65536)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        size += len(chunk)
+        if size > MAX_DAEMON_MESSAGE:
+            raise ChatGPTWebError("daemon message exceeded the size limit")
+    try:
+        value = json.loads(b"".join(chunks))
+    except json.JSONDecodeError as error:
+        raise ChatGPTWebError("daemon received invalid JSON") from error
+    if not isinstance(value, dict):
+        raise ChatGPTWebError("daemon message was not an object")
+    return value
+
+
+def send_json(connection: socket.socket, value: dict[str, Any]) -> None:
+    connection.sendall(json.dumps(
+        value, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8"))
+
+
+def send_json_line(connection: socket.socket, value: dict[str, Any]) -> None:
+    connection.sendall((json.dumps(
+        value, ensure_ascii=False, separators=(",", ":")
+    ) + "\n").encode("utf-8"))
+
+
+def daemon_request(socket_path: Path, request: dict[str, Any]) -> dict[str, Any]:
+    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    connection.settimeout(120)
+    try:
+        connection.connect(str(socket_path))
+        send_json(connection, request)
+        connection.shutdown(socket.SHUT_WR)
+        response = receive_json(connection)
+    finally:
+        connection.close()
+    if not response.get("ok"):
+        raise ChatGPTWebError(response.get("error", "daemon request failed"))
+    result = response.get("result", {})
+    if not isinstance(result, dict):
+        raise ChatGPTWebError("daemon returned an invalid result")
+    return result
+
+
+def daemon_stream_request(
+    socket_path: Path,
+    request: dict[str, Any],
+    on_event: Any,
+) -> dict[str, Any]:
+    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    connection.settimeout(330)
+    result: dict[str, Any] | None = None
+    try:
+        connection.connect(str(socket_path))
+        send_json(connection, request)
+        connection.shutdown(socket.SHUT_WR)
+        stream = connection.makefile("r", encoding="utf-8")
+        for line in stream:
+            message = json.loads(line)
+            if not message.get("ok"):
+                raise ChatGPTWebError(message.get("error", "daemon request failed"))
+            if "event" in message:
+                on_event(message["event"])
+            elif "result" in message:
+                result = message["result"]
+    finally:
+        connection.close()
+    if not isinstance(result, dict):
+        raise ChatGPTWebError("daemon stream ended without a result")
+    return result
+
+
+def daemon_is_ready(socket_path: Path) -> bool:
+    try:
+        return daemon_request(socket_path, {"command": "ping"}).get("ready") is True
+    except (ChatGPTWebError, OSError):
+        return False
+
+
+def start_daemon(socket_path: Path, cdp_url: str) -> None:
+    socket_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(socket_path.parent, 0o700)
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--cdp-url", cdp_url,
+        "daemon",
+        "--socket", str(socket_path),
+    ]
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+    deadline = time.monotonic() + 22
+    while time.monotonic() < deadline:
+        if daemon_is_ready(socket_path):
+            return
+        if process.poll() is not None:
+            raise ChatGPTWebError(
+                "daemon failed to start; ensure the authenticated debugging browser is running"
+            )
+        time.sleep(0.1)
+    process.terminate()
+    raise ChatGPTWebError("timed out starting the chatgpt-web daemon")
+
+
+def chrome_is_ready(cdp_url: str) -> bool:
+    try:
+        response = httpx.get(f"{cdp_url.rstrip('/')}/json/version", timeout=1.0)
+        return response.status_code == 200
+    except httpx.HTTPError:
+        return False
+
+
+def persistent_profile_path() -> Path:
+    data_home = os.environ.get("XDG_DATA_HOME")
+    root = Path(data_home) if data_home else Path.home() / ".local" / "share"
+    return root / "chatgpt-web" / "chrome-profile"
+
+
+def launch_login_browser(cdp_url: str) -> dict[str, Any]:
+    if chrome_is_ready(cdp_url):
+        return {"browser": "already_running", "cdp_url": cdp_url}
+    parsed = urlsplit(cdp_url)
+    if parsed.scheme != "http" or parsed.hostname not in ("127.0.0.1", "localhost"):
+        raise ChatGPTWebError("automatic browser launch requires a local HTTP CDP URL")
+    port = parsed.port or 9222
+    browser = next((
+        shutil.which(name) for name in
+        ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser")
+        if shutil.which(name)
+    ), None)
+    if not browser:
+        raise ChatGPTWebError("Chrome or Chromium was not found")
+    profile = persistent_profile_path()
+    profile.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(profile, 0o700)
+    subprocess.Popen(
+        [
+            browser,
+            f"--user-data-dir={profile}",
+            "--remote-debugging-address=127.0.0.1",
+            f"--remote-debugging-port={port}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--new-window",
+            "https://chatgpt.com/",
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        if chrome_is_ready(cdp_url):
+            return {
+                "browser": "started",
+                "cdp_url": cdp_url,
+                "profile": str(profile),
+                "login_required": True,
+            }
+        time.sleep(0.1)
+    raise ChatGPTWebError("Chrome started but its debugger did not become ready")
+
+
+def ensure_daemon(socket_path: Path, cdp_url: str) -> None:
+    if daemon_is_ready(socket_path):
+        return
+    start_daemon(socket_path, cdp_url)
+
+
+def handle_daemon_command(
+    client: ChatGPTWebClient, request: dict[str, Any]
+) -> tuple[dict[str, Any], bool]:
+    command = request.get("command")
+    if command == "ping":
+        return {"ready": True}, False
+    if command == "auth":
+        if request.get("refresh"):
+            client.refresh_auth(prefer_browser=True)
+        response = client.verify()
+        items = response.get("items", [])
+        return {
+            "authenticated": True,
+            "first_page_count": len(items) if isinstance(items, list) else None,
+        }, False
+    if command == "status":
+        return {
+            "daemon": "running",
+            "session_saved": auth_store_path().is_file(),
+            "chrome": "running" if chrome_is_ready(client.cdp_url) else "stopped",
+            "send_mode": os.environ.get("CHATGPT_WEB_SEND_MODE", "node"),
+            "sentinel_cache": sentinel_cache_status(),
+        }, False
+    if command == "list":
+        maximum = request.get("maximum")
+        if maximum is not None and (not isinstance(maximum, int) or maximum < 1):
+            raise ChatGPTWebError("invalid conversation limit")
+        return {"items": client.list_conversations(maximum)}, False
+    if command == "show":
+        conversation_id = request.get("conversation_id")
+        if not isinstance(conversation_id, str) or not conversation_id:
+            raise ChatGPTWebError("conversation ID is required")
+        return {"conversation": client.get_conversation(conversation_id)}, False
+    if command == "send":
+        conversation_id = request.get("conversation_id")
+        prompt = request.get("prompt")
+        if conversation_id is not None and not isinstance(conversation_id, str):
+            raise ChatGPTWebError("invalid conversation ID")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ChatGPTWebError("prompt must not be empty")
+        resolved_id, conversation, previous_ids = client.send_prompt(
+            conversation_id, prompt
+        )
+        return {
+            "conversation_id": resolved_id,
+            "conversation": conversation,
+            "previous_ids": sorted(previous_ids),
+        }, False
+    if command == "stop":
+        return {"stopping": True}, True
+    raise ChatGPTWebError(f"unknown daemon command: {command}")
+
+
+def run_daemon(socket_path: Path, cdp_url: str) -> int:
+    socket_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(socket_path.parent, 0o700)
+    lock_path = socket_path.with_suffix(".lock")
+    lock = open(lock_path, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock.close()
+        return 0
+
+    if socket_path.exists():
+        socket_path.unlink()
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    stopping = False
+
+    def request_stop(_signum: int, _frame: object) -> None:
+        nonlocal stopping
+        stopping = True
+        server.close()
+
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
+    try:
+        with ChatGPTWebClient(cdp_url) as client:
+            server.bind(str(socket_path))
+            os.chmod(socket_path, 0o600)
+            server.listen(8)
+            while not stopping:
+                try:
+                    connection, _ = server.accept()
+                except OSError:
+                    if stopping:
+                        break
+                    raise
+                stop_after_response = False
+                with connection:
+                    try:
+                        request = receive_json(connection)
+                        if request.get("command") == "send_stream":
+                            conversation_id = request.get("conversation_id")
+                            prompt = request.get("prompt")
+                            if conversation_id is not None and not isinstance(
+                                conversation_id, str
+                            ):
+                                raise ChatGPTWebError("invalid conversation ID")
+                            if not isinstance(prompt, str) or not prompt.strip():
+                                raise ChatGPTWebError("prompt must not be empty")
+                            resolved_id, conversation, previous_ids = client.send_prompt(
+                                conversation_id,
+                                prompt,
+                                lambda event: send_json_line(connection, {
+                                    "ok": True, "event": event,
+                                }),
+                            )
+                            send_json_line(connection, {
+                                "ok": True,
+                                "result": {
+                                    "conversation_id": resolved_id,
+                                    "conversation": conversation,
+                                    "previous_ids": sorted(previous_ids),
+                                },
+                            })
+                            continue
+                        result, stop_after_response = handle_daemon_command(client, request)
+                        send_json(connection, {"ok": True, "result": result})
+                    except (ChatGPTWebError, httpx.HTTPError, OSError) as error:
+                        try:
+                            send_json_line(connection, {
+                                "ok": False, "error": str(error),
+                            })
+                        except OSError:
+                            pass
+                if stop_after_response:
+                    stopping = True
+    finally:
+        server.close()
+        if socket_path.exists():
+            socket_path.unlink()
+        lock.close()
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="chatgpt-web")
+    parser.add_argument(
+        "--cdp-url",
+        default=os.environ.get("CHATGPT_WEB_CDP_URL", DEFAULT_CDP_URL),
+        help="Chrome DevTools HTTP endpoint (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--socket",
+        type=Path,
+        default=default_socket_path(),
+        help="daemon Unix socket (default: %(default)s)",
+    )
+    commands = parser.add_subparsers(dest="command")
+    commands.add_parser("login", help="launch the persistent login browser")
+    auth_parser = commands.add_parser(
+        "auth", help="verify the saved ChatGPT session"
+    )
+    auth_parser.add_argument(
+        "--refresh", action="store_true", help="recapture credentials from Chrome"
+    )
+
+    list_parser = commands.add_parser("list", help="list conversations")
+    extent = list_parser.add_mutually_exclusive_group()
+    extent.add_argument("--all", action="store_true", help="fetch every page")
+    extent.add_argument("--limit", type=int, default=DEFAULT_PAGE_SIZE)
+    list_parser.add_argument(
+        "--output", choices=("table", "json", "jsonl"), default="table"
+    )
+
+    show_parser = commands.add_parser("show", help="show one conversation")
+    show_parser.add_argument("conversation_id")
+    show_parser.add_argument(
+        "--output", choices=("markdown", "json", "jsonl"), default="markdown"
+    )
+    send_parser = commands.add_parser("send", help="send a prompt")
+    send_parser.add_argument("conversation_id")
+    send_parser.add_argument("prompt", nargs="*")
+    send_parser.add_argument(
+        "--output", choices=("text", "json", "jsonl"), default="text"
+    )
+    new_parser = commands.add_parser("new", help="start a new conversation")
+    new_parser.add_argument("prompt", nargs="*")
+    new_parser.add_argument(
+        "--output", choices=("text", "json", "jsonl"), default="text"
+    )
+    resume_parser = commands.add_parser("resume", help="open an interactive conversation")
+    resume_parser.add_argument("conversation_id")
+    daemon_parser = commands.add_parser(
+        "daemon", help="run the background service in the foreground"
+    )
+    daemon_parser.add_argument("--socket", dest="daemon_socket", type=Path)
+    commands.add_parser("status", help="show daemon, session, and browser state")
+    commands.add_parser("stop", help="stop the background daemon")
+    commands.add_parser("logout", help="stop the daemon and delete saved credentials")
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    try:
+        if args.command == "login":
+            print(json.dumps(
+                launch_login_browser(args.cdp_url), separators=(",", ":")
+            ))
+            return 0
+        if args.command == "daemon":
+            return run_daemon(args.daemon_socket or args.socket, args.cdp_url)
+        if args.command == "stop":
+            result = daemon_request(args.socket, {"command": "stop"})
+            print(json.dumps(result, separators=(",", ":")))
+            return 0
+        if args.command == "logout":
+            if daemon_is_ready(args.socket):
+                daemon_request(args.socket, {"command": "stop"})
+            path = auth_store_path()
+            path.unlink(missing_ok=True)
+            print(json.dumps({"logged_out": True}, separators=(",", ":")))
+            return 0
+
+        ensure_daemon(args.socket, args.cdp_url)
+        if args.command is None:
+            if not sys.stdin.isatty():
+                raise ChatGPTWebError(
+                    "interactive mode requires a terminal; use new or send for piped input"
+                )
+            return run_picker(args.socket)
+        if args.command == "auth":
+            result = daemon_request(
+                args.socket, {"command": "auth", "refresh": args.refresh}
+            )
+            print(json.dumps(result, separators=(",", ":")))
+        elif args.command == "status":
+            result = daemon_request(args.socket, {"command": "status"})
+            print(json.dumps(result, separators=(",", ":")))
+        elif args.command == "list":
+            if args.limit is not None and args.limit < 1:
+                raise ChatGPTWebError("--limit must be greater than zero")
+            result = daemon_request(args.socket, {
+                "command": "list",
+                "maximum": None if args.all else args.limit,
+            })
+            print_conversation_list(result.get("items", []), args.output)
+        elif args.command == "show":
+            result = daemon_request(args.socket, {
+                "command": "show",
+                "conversation_id": args.conversation_id,
+            })
+            print_conversation(result.get("conversation", {}), args.output)
+        elif args.command in ("send", "new"):
+            prompt = " ".join(args.prompt).strip()
+            if not prompt and not sys.stdin.isatty():
+                prompt = sys.stdin.read().strip()
+            if not prompt:
+                raise ChatGPTWebError("provide a prompt argument or pipe one on stdin")
+            result = stream_prompt(
+                args.socket,
+                args.conversation_id if args.command == "send" else None,
+                prompt,
+                args.output,
+            )
+            if args.command == "new" and args.output == "text":
+                print(f"\n[conversation {result.get('conversation_id')}]", file=sys.stderr)
+        elif args.command == "resume":
+            conversation_id = args.conversation_id
+            conversation = daemon_request(args.socket, {
+                "command": "show", "conversation_id": conversation_id,
+            }).get("conversation", {})
+            run_repl(args.socket, conversation_id, conversation_title(conversation))
+
+    except KeyboardInterrupt:
+        print("\n[interrupted]", file=sys.stderr)
+        return 130
+    except (ChatGPTWebError, httpx.HTTPError) as error:
+        print(f"chatgpt-web: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
