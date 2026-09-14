@@ -503,6 +503,13 @@ class ChatTui:
         sys.stdout.write(rendered)
         sys.stdout.flush()
 
+    @staticmethod
+    def reset_terminal_session() -> None:
+        # Clear the visible screen and purge earlier terminal scrollback while
+        # staying on the main screen. This makes launch the history boundary.
+        sys.stdout.write("\x1b[2J\x1b[3J\x1b[H")
+        sys.stdout.flush()
+
     def retain_history_tail(self, rendered: str) -> None:
         transcript_rows = max(1, self.viewport_height().preferred - 5)
         self.history_tail = "".join(
@@ -1037,6 +1044,7 @@ class ChatTui:
             self.commit_completed_turns()
 
     def run(self) -> None:
+        self.reset_terminal_session()
         self.commit_initial_history()
 
         def started() -> None:
