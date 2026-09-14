@@ -1,150 +1,175 @@
-# chatgpt-web
+# 🌸 chatgpt-web
 
-Experimental terminal client for an authenticated ChatGPT web session. It uses
-a dedicated Chrome instance to capture login credentials, a Node-based Sentinel
-signer for per-turn write challenges, and a local Python HTTP client for
-conversation reads, writes, and SSE streams.
+> A fast, Codex-inspired terminal client for your ChatGPT conversations.
 
-This uses undocumented ChatGPT web endpoints. It may stop working when the web
-application changes.
+`chatgpt-web` connects to an authenticated ChatGPT web session and brings it to
+the terminal: streaming answers, searchable history, Markdown rendering,
+syntax-highlighted code, native scrollback, and a bottom composer that feels at
+home beside modern coding agents.
 
-## Requirements
+> [!IMPORTANT]
+> This is an experimental, unofficial client for undocumented ChatGPT web
+> endpoints. It may stop working when the web application changes. It is not an
+> OpenAI API client and is not affiliated with or endorsed by OpenAI.
 
-- Python 3.10 or newer
-- `httpx`
-- Node.js 22 or newer
-- Chrome or Chromium for the initial interactive login
+## ✨ Highlights
 
-The installed launcher prefers `uv` and reads the PEP 723 dependency metadata
-from the executable, creating and caching an isolated environment automatically.
-Install manually with `pip install -r requirements.txt` when `uv` is unavailable.
+- 🖥️ **Codex-style terminal UI** with a full viewport and bottom composer
+- ⚡ **Streaming responses** with responsive input while generation continues
+- 🔎 **Searchable resume picker** for recent conversations
+- 🧠 **Persistent authentication** after a one-time interactive Chrome login
+- 🚀 **Browserless operation** after authentication, including write signing
+- 🎨 **Rich Markdown** with syntax-highlighted fenced code blocks
+- 📜 **Native terminal scrollback** bounded to the current session
+- 🧹 **Clean history rendering** that hides internal tool-protocol payloads
+- 📋 **Clipboard support** through `/copy`
+- 🪶 **Zero manual environment setup** when launched with `uv`
 
-Launch Chrome with a dedicated persistent profile:
+## 🚦 Quick start
 
-```sh
-./chatgpt-web/run login
+### Requirements
+
+- Python 3.10+
+- [`uv`](https://docs.astral.sh/uv/) (recommended), or `pip`
+- Node.js 22+
+- Chrome or Chromium for the initial login
+
+```bash
+git clone https://github.com/tritao/chatgpt-web.git
+cd chatgpt-web
+
+# Open a dedicated Chrome profile and log in to ChatGPT.
+./run login
+
+# Capture the authenticated session, then launch the terminal UI.
+./run auth
+./run
 ```
 
-The equivalent manual command is:
+Chrome can be closed after `auth` succeeds. The local daemon persists the
+session and performs subsequent reads and writes without a running browser.
 
-```sh
-profile_dir="${XDG_DATA_HOME:-$HOME/.local/share}/chatgpt-web/chrome-profile"
-mkdir -p "$profile_dir"
-chmod 700 "$profile_dir"
-google-chrome \
-  --user-data-dir="$profile_dir" \
-  --remote-debugging-address=127.0.0.1 \
-  --remote-debugging-port=9222 \
-  https://chatgpt.com/
+To make the command available everywhere:
+
+```bash
+mkdir -p ~/.local/bin
+ln -s "$(pwd)/run" ~/.local/bin/chatgpt-web
 ```
 
-This profile persists the ChatGPT login across browser and daemon restarts. Do
-not open the same profile in another Chrome process. Log in through the Chrome
-window and start the daemon with an authenticated command. Chrome can then be
-closed while the daemon remains running. Use:
+## 🎮 Terminal controls
 
-```sh
-chatgpt-web
-./chatgpt-web/run auth
-./chatgpt-web/run list
-./chatgpt-web/run list --limit 100
-./chatgpt-web/run list --all --output jsonl
-./chatgpt-web/run show CONVERSATION_ID
-./chatgpt-web/run show CONVERSATION_ID --output jsonl
-./chatgpt-web/run new "Explain monads in one paragraph"
-./chatgpt-web/run send CONVERSATION_ID "Continue, with an example"
-./chatgpt-web/run resume CONVERSATION_ID
-./chatgpt-web/run status
-./chatgpt-web/run logout
+| Key | Action |
+| --- | --- |
+| `Enter` | Send the prompt |
+| `Alt+Enter` | Insert a newline |
+| `Ctrl+R` | Open the searchable conversation picker |
+| `Ctrl+C` | Stop an active response |
+| `Ctrl+D` | Exit from an empty prompt |
+| `PageUp` / `PageDown` | Move through the transcript |
+| `End` | Follow new output at the bottom |
+| `Tab` / `Enter` | Accept a slash-command completion |
+| `Escape` | Close autocomplete or the resume picker |
+
+Type `/` to open command completion:
+
+| Command | Action |
+| --- | --- |
+| `/new` | Start a new conversation |
+| `/resume` | Search recent conversations |
+| `/resume ID` | Open a conversation directly |
+| `/history` | Reload the current conversation |
+| `/copy` | Copy the latest assistant response |
+| `/clear` | Clear the displayed transcript |
+| `/help` | Show command help |
+| `/exit`, `/quit` | Exit the client |
+
+## 🧰 Command-line usage
+
+The same session can be used without the interactive UI:
+
+```bash
+./run list
+./run list --limit 100
+./run list --all --output jsonl
+./run show CONVERSATION_ID
+./run new "Explain monads in one paragraph"
+./run send CONVERSATION_ID "Continue with an example"
+./run resume CONVERSATION_ID
+./run status
+./run stop
+./run logout
 ```
 
-Running `chatgpt-web` without a subcommand opens an inline terminal client
-with a scrollable, syntax-highlighted Markdown transcript and a multiline
-prompt at the bottom. It stays on the terminal's main screen so transcript
-history participates in native terminal scrollback. Enter submits, Alt+Enter inserts a newline, Ctrl+C
-stops an active response, Ctrl+D exits from an empty prompt, and PageUp/PageDown
-scroll the transcript. New output follows the bottom automatically; PageUp
-pauses following and End resumes it. `/resume` or Ctrl+R opens a centered,
-searchable list of recent conversations; use Up/Down, Enter, and Escape to navigate it. Commands
-also include `/new`, `/resume ID`, `/history`, `/copy`, `/clear`, `/help`, and
-`/exit` or `/quit`. `/copy` copies the latest assistant response to the system clipboard.
-Typing `/` opens the command menu; use Up/Down and Tab or Enter to complete a
-command, then Enter to run it.
-`chatgpt-web resume CONVERSATION_ID` opens an existing conversation directly in
-the fullscreen client.
+## 🏗️ How it works
 
-Set `CHATGPT_WEB_CDP_URL` or pass `--cdp-url` when Chrome uses another local
-debugging port.
+```mermaid
+flowchart LR
+    C[Chrome login] -->|one-time session capture| D[Local daemon]
+    T[Terminal UI] <-->|Unix socket| D
+    D <-->|HTTP + SSE| G[ChatGPT web]
+    D --> S[Node Sentinel signer]
+    S -->|per-turn proof headers| D
+```
 
-The first authenticated command captures the browser session and atomically
-saves it to a mode-0600 file at
-`${XDG_STATE_HOME:-$HOME/.local/state}/chatgpt-web/session.json`. Later daemon
-starts load that file with Chrome stopped. The daemon serves CLI invocations
-through a mode-0600 Unix socket below `XDG_RUNTIME_DIR`. On HTTP 401 or 403 it
-uses the saved cookies with `/api/auth/session` to refresh the access token. If
-the login itself has expired, run `chatgpt-web login` followed by
-`chatgpt-web auth --refresh`.
+1. `login` starts Chrome with a dedicated, persistent profile.
+2. `auth` captures the authenticated browser session through local Chrome
+   DevTools Protocol and stores it in a mode-`0600` state file.
+3. A local daemon serves CLI invocations through a mode-`0600` Unix socket.
+4. Python performs conversation reads, writes, and SSE streaming directly.
+5. The Node helper evaluates ChatGPT's current Sentinel proof and `dx`
+   interpreters to produce per-turn write headers.
 
-Use `chatgpt-web status` to inspect the daemon, saved-session, Chrome, and send
-mode state. `chatgpt-web stop` stops the daemon but preserves credentials.
-`chatgpt-web logout` stops it and deletes the saved credential file.
+The Chrome process is therefore an authentication and compatibility bootstrap,
+not a permanent transport dependency.
 
-Authentication headers and cookies move directly from the Chrome helper to the
-daemon through a pipe. They are never printed. The saved session contains
-account credentials and must be protected like a password; the CLI creates its
-directory as mode 0700 and the file as mode 0600.
+## 🔐 Local data and security
 
-For writes, `sentinel-node-probe.js` runs the current Sentinel proof and `dx`
-interpreters in an isolated Node VM. Python calls Sentinel `prepare`, passes the
-requirements to Node, attaches the resulting proof headers, constructs the
-conversation request, and renders ordinary uncompressed SSE message snapshots.
-Conversation reads and final response reconciliation also use the Python HTTP
-client. `Ctrl+C` closes the direct response stream. Chrome does not need to be
-running for this path once the daemon has captured an authenticated session.
+The saved session grants access to your ChatGPT account and must be treated like
+a password.
 
-Set `CHATGPT_WEB_SEND_MODE=recipe` when launching the daemon to have Chrome
-construct the request while Python transports it. Set it to `chrome` for the
-legacy browser-driven sender and DOM streaming path.
+| Data | Default location | Permissions |
+| --- | --- | --- |
+| Chrome profile | `~/.local/share/chatgpt-web/chrome-profile` | directory `0700` |
+| Saved session | `~/.local/state/chatgpt-web/session.json` | file `0600` |
+| Sentinel cache | `~/.cache/chatgpt-web/sentinel` | directory `0700`, files `0600` |
+| Daemon socket | `$XDG_RUNTIME_DIR` | file `0600` |
 
-## Direct-send investigation
+Authentication headers and cookies move from the Chrome helper to the daemon
+through a pipe and are never printed. Run `./run logout` to stop the daemon and
+delete the saved credential file.
 
-The `chrome-recipe.js` diagnostic established that a captured request can be
-replayed with Python/httpx over HTTP/1.1. It remains available as a compatibility
-fallback; its request recipe moves over a private pipe and is never persisted.
+## ⚙️ Configuration
 
-The frontend currently obtains per-turn values from
-`/backend-api/sentinel/chat-requirements/prepare` and
-`/backend-api/sentinel/chat-requirements/finalize`. The resulting send carries
-the following dynamic headers:
+| Variable | Purpose |
+| --- | --- |
+| `CHATGPT_WEB_MODEL` | Model label shown by the terminal UI |
+| `CHATGPT_WEB_CDP_URL` | Chrome DevTools URL when it is not on the default port |
+| `CHATGPT_WEB_SEND_MODE=recipe` | Use Chrome to construct a request recipe |
+| `CHATGPT_WEB_SEND_MODE=chrome` | Use the legacy browser-driven sender |
 
-- `openai-sentinel-chat-requirements-prepare-token`
-- `openai-sentinel-proof-token`
-- `openai-sentinel-turnstile-token`
-- an optional `x-conduit-token`
+The direct sender does not retry HTTP `429` responses or unavailable composers.
+This avoids retry loops that can extend a rate limit.
 
-In the verified session, every turn included a large Turnstile token. The
-Sentinel SDK consumes its cached requirement/proof state when minting the turn
-token and then prepares the next proof. This makes the SDK and browser challenge
-the remaining browser dependency; copying a static set of headers is not a
-stable browserless implementation.
+## 🧪 Development setup
 
-`sentinel-node-probe.js` downloads the current Sentinel SDK and evaluates it in
-an isolated Node VM with SDK network access disabled. The SDK's proof-of-work
-engine and `turnstile.dx` bytecode interpreter run under the supplied Web API
-shims. A real prepare response was successfully solved in Node, accepted by the
-finalize endpoint, and accepted by the conversation endpoint through the
-prepared three-header flow. Pass a captured requirements object through
-`--requirements-stdin` to inspect compatibility without writing it to disk.
+The `run` launcher uses the PEP 723 metadata embedded in `chatgpt-web` and lets
+`uv` create and cache the Python environment automatically. To install
+dependencies manually:
 
-The SDK implementation is cached below
-`${XDG_CACHE_HOME:-$HOME/.cache}/chatgpt-web/sentinel`. Cache files and their
-manifest are mode 0600 inside a mode-0700 directory. Each load verifies the
-recorded SHA-256. The bootstrap is checked at most once every six hours; a
-verified stale copy remains usable when the asset host is unavailable. If a new
-SDK no longer matches the supported proof/VM signatures, the CLI uses recipe
-mode when an authenticated Chrome is already running, or asks the user to run
-`chatgpt-web login` for that compatibility fallback.
+```bash
+python -m venv .venv
+. .venv/bin/activate
+pip install -r requirements.txt
+./chatgpt-web --help
+```
 
-The client does not retry HTTP 429 responses or unavailable composers. It
-reports the rate limit and leaves the next attempt to the user, avoiding a
-retry loop that could extend the limit.
+The browser-facing endpoints and Sentinel implementation are undocumented and
+change without notice. Compatibility fixes should preserve the browser login
+fallback and must never log captured credentials or proof tokens.
+
+## ⚠️ Project status
+
+This project is suitable for experimentation on your own account. Expect
+occasional breakage, rate limits, forced reauthentication, and protocol changes.
+For supported integrations and production applications, use the official OpenAI
+API instead.
