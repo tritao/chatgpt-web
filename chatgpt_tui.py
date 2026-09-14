@@ -27,6 +27,7 @@ from prompt_toolkit.data_structures import Point
 from prompt_toolkit.widgets import Frame, TextArea
 from rich.console import Console
 from rich.markdown import CodeBlock, Markdown
+from rich.padding import Padding
 from rich.rule import Rule
 from rich.syntax import Syntax
 from rich.text import Text
@@ -426,8 +427,12 @@ class ChatTui:
         if separated and role == "user":
             console.print(Rule(style="#606060"))
         if role == "user":
-            console.print(Text("› ", style="bold #67e8f9"), end="")
-            console.print(Text(text, style="#f3f4f6"))
+            prompt = Text()
+            prompt.append("› ", style="bold #67e8f9")
+            prompt.append(text, style="#f3f4f6")
+            console.print(
+                Padding(prompt, (1, 2), style="on #4b4b4b", expand=True)
+            )
         elif role == "assistant":
             console.print(Text("• ", style="bold #86efac"), end="")
             if text:
