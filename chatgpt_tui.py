@@ -242,6 +242,9 @@ class ChatTui:
             if visible is not None:
                 self.messages.append(visible)
         self.busy = False
+        self.loading_conversation = False
+        self.loading_started: float | None = None
+        self.load_on_start = conversation_id is not None and not initial_messages
         self.status = "Ready"
         self.cancel_connection: Any = None
         self.lock = threading.RLock()
@@ -405,10 +408,11 @@ class ChatTui:
         return f"{total // 60}m {total % 60:02d}s"
 
     def render_activity(self) -> FormattedText:
-        if self.busy and self.active_started is not None:
+        started = self.active_started if self.busy else self.loading_started
+        if started is not None:
             frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-            frame = frames[int((time.monotonic() - self.active_started) * 10) % len(frames)]
-            elapsed = self.format_elapsed(time.monotonic() - self.active_started)
+            frame = frames[int((time.monotonic() - started) * 10) % len(frames)]
+            elapsed = self.format_elapsed(time.monotonic() - started)
             return FormattedText([("", f" {frame} {self.status} · {elapsed} ")])
         if self.status not in ("Ready", ""):
             return FormattedText([("", f" • {self.status} ")])
@@ -423,7 +427,7 @@ class ChatTui:
         home = str(Path.home())
         if cwd == home or cwd.startswith(home + os.sep):
             cwd = "~" + cwd[len(home):]
-        state = "streaming" if self.busy else "ready"
+        state = "streaming" if self.busy else "loading" if self.loading_conversation else "ready"
         title = self.title if len(self.title) <= 42 else self.title[:39] + "…"
         return FormattedText([
             ("class:metadata.model", f" {self.model} "),
@@ -516,6 +520,8 @@ class ChatTui:
             )
 
             def finished(_future: Any) -> None:
+                self.loading_conversation = False
+                self.loading_started = None
                 self.status = "Ready"
                 self.scroll_bottom()
 
@@ -751,6 +757,10 @@ class ChatTui:
         self.app.invalidate()
 
     def submit_prompt(self) -> None:
+        if self.loading_conversation:
+            self.status = "Conversation still loading · draft kept"
+            self.app.invalidate()
+            return
         if self.busy:
             self.status = "Response active · draft kept for the next turn"
             self.app.invalidate()
@@ -867,7 +877,7 @@ class ChatTui:
         self.app.invalidate()
 
     def open_resume(self) -> None:
-        if self.busy or self.resume_visible:
+        if self.busy or self.loading_conversation or self.resume_visible:
             return
         self.resume_visible = True
         self.resume_loading = True
@@ -924,6 +934,8 @@ class ChatTui:
         self.resume_conversation(conversation_id)
 
     def resume_conversation(self, conversation_id: str) -> None:
+        self.loading_conversation = True
+        self.loading_started = time.monotonic()
         self.status = "Loading conversation…"
         self.app.invalidate()
 
@@ -941,6 +953,8 @@ class ChatTui:
                 self.title = conversation.get("title") or "Untitled"
                 self.commit_loaded_history(messages)
             except Exception as error:
+                self.loading_conversation = False
+                self.loading_started = None
                 self.status = f"Load failed: {error}"
                 self.app.invalidate()
 
@@ -1013,6 +1027,8 @@ class ChatTui:
 
         def started() -> None:
             self.event_loop = asyncio.get_running_loop()
+            if self.load_on_start and self.conversation_id is not None:
+                self.resume_conversation(self.conversation_id)
 
         self.app.run(pre_run=started)
 

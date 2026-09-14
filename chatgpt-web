@@ -935,14 +935,6 @@ def run_fullscreen(
             "fullscreen UI dependencies are missing; install chatgpt-web/requirements.txt"
         ) from error
 
-    initial: dict[str, Any] | None = None
-    if conversation_id:
-        raw = daemon_request(socket_path, {
-            "command": "show", "conversation_id": conversation_id,
-        }).get("conversation", {})
-        if isinstance(raw, dict):
-            initial = normalize_conversation(raw)
-
     def list_recent() -> list[dict[str, Any]]:
         items = daemon_request(socket_path, {
             "command": "list", "maximum": 50,
@@ -972,9 +964,9 @@ def run_fullscreen(
         load,
         send,
         conversation_id,
-        conversation_title(initial or {}),
-        (initial or {}).get("messages", []),
-        (initial or {}).get("model"),
+        "Loading conversation" if conversation_id else "New conversation",
+        None,
+        None,
     )
     return 0
 
