@@ -494,6 +494,30 @@ class ChatTui:
         if self.event_loop is not None:
             self.event_loop.call_soon_threadsafe(schedule_write)
 
+    def commit_completed_turns(self) -> None:
+        with self.lock:
+            end = len(self.messages)
+            messages = [
+                dict(message)
+                for message in self.messages[self.committed_message_count:end]
+            ]
+            # Remove completed turns from the live layout immediately. Rich
+            # rendering and terminal output happen off the input event loop.
+            self.committed_message_count = end
+        if not messages:
+            return
+        rendered = self.render_history(messages)
+
+        def schedule_write() -> None:
+            future = run_in_terminal(
+                lambda: self.write_terminal_history(rendered),
+                render_cli_done=False,
+            )
+            future.add_done_callback(lambda _future: self.scroll_bottom())
+
+        if self.event_loop is not None:
+            self.event_loop.call_soon_threadsafe(schedule_write)
+
     def render_formatted_transcript(self) -> ANSI:
         rendered = self.render_transcript()
         if rendered != self.formatted_transcript_source:
@@ -952,7 +976,7 @@ class ChatTui:
             self.active_started = None
             self.cancel_connection = None
             self.busy = False
-            self.scroll_bottom(force=False)
+            self.commit_completed_turns()
 
     def run(self) -> None:
         self.commit_initial_history()
