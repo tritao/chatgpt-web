@@ -42,9 +42,16 @@ Message = dict[str, str]
 LoadConversation = Callable[[str], dict[str, Any]]
 ListConversations = Callable[[], list[dict[str, Any]]]
 SendPrompt = Callable[
-    [str | None, str, Callable[[dict[str, Any]], None], Callable[[Any], None]],
+    [
+        str | None,
+        str,
+        list[dict[str, Any]],
+        Callable[[dict[str, Any]], None],
+        Callable[[Any], None],
+    ],
     dict[str, Any],
 ]
+UploadImage = Callable[[bytes, str, str, int, int], dict[str, Any]]
 
 ANNOTATION_PATTERN = re.compile(r"\ue200([^\ue201\ue202]+)(?:\ue202(.*?))?\ue201")
 WRITING_DIRECTIVE_PATTERN = re.compile(
@@ -103,6 +110,7 @@ class SlashCommandCompleter(Completer):
         ("/resume", "search recent conversations"),
         ("/history", "reload this conversation"),
         ("/copy", "copy the latest response"),
+        ("/remove", "remove the latest image"),
         ("/clear", "clear the displayed transcript"),
         ("/help", "show available commands"),
         ("/exit", "quit chatgpt-web"),
@@ -229,10 +237,12 @@ class ChatTui:
         title: str = "New conversation",
         initial_messages: list[dict[str, Any]] | None = None,
         model: str | None = None,
+        upload_image: UploadImage | None = None,
     ) -> None:
         self.list_conversations = list_conversations
         self.load_conversation = load_conversation
         self.send_prompt = send_prompt
+        self.upload_image = upload_image
         self.conversation_id = conversation_id
         self.title = title
         self.model = model or os.environ.get("CHATGPT_WEB_MODEL", "gpt-5-6-thinking")
@@ -245,6 +255,9 @@ class ChatTui:
         self.loading_conversation = False
         self.loading_started: float | None = None
         self.load_on_start = conversation_id is not None and not initial_messages
+        self.uploading_image = False
+        self.upload_started: float | None = None
+        self.pending_attachments: list[dict[str, Any]] = []
         self.status = "Ready"
         self.cancel_connection: Any = None
         self.lock = threading.RLock()
@@ -409,7 +422,11 @@ class ChatTui:
         return f"{total // 60}m {total % 60:02d}s"
 
     def render_activity(self) -> FormattedText:
-        started = self.active_started if self.busy else self.loading_started
+        started = (
+            self.active_started if self.busy
+            else self.loading_started if self.loading_conversation
+            else self.upload_started
+        )
         if started is not None:
             frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
             frame = frames[int((time.monotonic() - started) * 10) % len(frames)]
@@ -417,6 +434,9 @@ class ChatTui:
             return FormattedText([("", f" {frame} {self.status} · {elapsed} ")])
         if self.status not in ("Ready", ""):
             return FormattedText([("", f" • {self.status} ")])
+        if self.pending_attachments:
+            names = ", ".join(item["name"] for item in self.pending_attachments)
+            return FormattedText([("", f" 📎 {names} · /remove to detach ")])
         if self.last_elapsed is not None:
             return FormattedText([
                 ("", f" — Worked for {self.format_elapsed(self.last_elapsed)} "),
@@ -428,7 +448,12 @@ class ChatTui:
         home = str(Path.home())
         if cwd == home or cwd.startswith(home + os.sep):
             cwd = "~" + cwd[len(home):]
-        state = "streaming" if self.busy else "loading" if self.loading_conversation else "ready"
+        state = (
+            "streaming" if self.busy else
+            "loading" if self.loading_conversation else
+            "uploading" if self.uploading_image else
+            "ready"
+        )
         title = self.title if len(self.title) <= 42 else self.title[:39] + "…"
         return FormattedText([
             ("class:metadata.model", f" {self.model} "),
@@ -711,6 +736,10 @@ class ChatTui:
         def resume_picker(_event: Any) -> None:
             self.open_resume()
 
+        @bindings.add("c-v", eager=True)
+        def paste_image(_event: Any) -> None:
+            self.paste_clipboard_image()
+
         @bindings.add("up", filter=self.resume_filter, eager=True)
         def resume_up(_event: Any) -> None:
             if self.resume_filtered:
@@ -787,21 +816,30 @@ class ChatTui:
             self.app.invalidate()
             return
         prompt = self.input.text.strip()
-        if not prompt:
+        attachments = list(self.pending_attachments)
+        if not prompt and not attachments:
             return
         self.input.text = ""
         if prompt.startswith("/"):
             self.handle_command(prompt)
             return
+        self.pending_attachments.clear()
+        prompt = prompt or "Describe the attached image."
+        display_prompt = prompt
+        if attachments:
+            labels = " ".join(f"[📎 {item['name']}]" for item in attachments)
+            display_prompt = f"{display_prompt}\n\n{labels}"
         with self.lock:
-            self.messages.append({"role": "user", "text": prompt})
+            self.messages.append({"role": "user", "text": display_prompt})
             self.messages.append({"role": "assistant", "text": ""})
         self.busy = True
         self.active_started = time.monotonic()
         self.last_elapsed = None
         self.status = "Preparing secure request…"
         self.scroll_bottom()
-        threading.Thread(target=self.run_send, args=(prompt,), daemon=True).start()
+        threading.Thread(
+            target=self.run_send, args=(prompt, attachments), daemon=True
+        ).start()
 
     def handle_command(self, command: str) -> None:
         name, _, argument = command.partition(" ")
@@ -814,6 +852,7 @@ class ChatTui:
                 self.history_tail = ""
             self.conversation_id = None
             self.title = "New conversation"
+            self.pending_attachments.clear()
             self.status = "Started a new conversation"
             self.scroll_bottom()
         elif name == "/clear":
@@ -836,6 +875,13 @@ class ChatTui:
                 self.app.invalidate()
         elif name == "/copy":
             self.copy_latest_response()
+        elif name == "/remove":
+            if self.pending_attachments:
+                removed = self.pending_attachments.pop()
+                self.status = f"Removed {removed['name']}"
+            else:
+                self.status = "No pending image to remove"
+            self.app.invalidate()
         elif name == "/help":
             self.append_system(
                 "**Commands**\n\n"
@@ -844,12 +890,79 @@ class ChatTui:
                 "- `/resume ID` open a conversation directly\n"
                 "- `/history` reload this conversation\n"
                 "- `/copy` copy the latest assistant response\n"
+                "- `/remove` remove the latest pending image\n"
                 "- `/clear` clear the displayed transcript\n"
                 "- `/exit` or `/quit` quit"
             )
         else:
             self.status = f"Unknown command: {name}"
             self.app.invalidate()
+
+    @staticmethod
+    def read_clipboard_png() -> bytes:
+        commands = []
+        if shutil.which("wl-paste"):
+            commands.append(["wl-paste", "--no-newline", "--type", "image/png"])
+        if shutil.which("xclip"):
+            commands.append(["xclip", "-selection", "clipboard", "-t", "image/png", "-o"])
+        if shutil.which("pngpaste"):
+            commands.append(["pngpaste", "-"])
+        for command in commands:
+            try:
+                result = subprocess.run(
+                    command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    timeout=5,
+                    check=False,
+                )
+            except (OSError, subprocess.SubprocessError):
+                continue
+            if result.returncode == 0 and result.stdout.startswith(b"\x89PNG\r\n\x1a\n"):
+                return result.stdout
+        raise RuntimeError("clipboard does not contain a PNG image")
+
+    def paste_clipboard_image(self) -> None:
+        if self.uploading_image:
+            self.status = "An image upload is already in progress"
+            self.app.invalidate()
+            return
+        if self.upload_image is None:
+            self.status = "Image upload is unavailable"
+            self.app.invalidate()
+            return
+        self.uploading_image = True
+        self.upload_started = time.monotonic()
+        self.status = "Reading image from clipboard…"
+        self.app.invalidate()
+
+        def upload() -> None:
+            try:
+                data = self.read_clipboard_png()
+                if len(data) < 24:
+                    raise RuntimeError("clipboard PNG is truncated")
+                width = int.from_bytes(data[16:20], "big")
+                height = int.from_bytes(data[20:24], "big")
+                if width < 1 or height < 1:
+                    raise RuntimeError("clipboard PNG has invalid dimensions")
+                name = datetime.now().strftime("clipboard-%Y%m%d-%H%M%S.png")
+                self.status = f"Uploading {width}×{height} image…"
+                self.app.invalidate()
+                attachment = self.upload_image(
+                    data, name, "image/png", width, height
+                )
+                if not isinstance(attachment, dict) or not attachment.get("id"):
+                    raise RuntimeError("image upload returned no file ID")
+                self.pending_attachments.append(attachment)
+                self.status = "Ready"
+            except Exception as error:
+                self.status = f"Image paste failed: {error}"
+            finally:
+                self.uploading_image = False
+                self.upload_started = None
+                self.app.invalidate()
+
+        threading.Thread(target=upload, daemon=True).start()
 
     def copy_latest_response(self) -> None:
         with self.lock:
@@ -983,7 +1096,7 @@ class ChatTui:
 
         threading.Thread(target=load_selected, daemon=True).start()
 
-    def run_send(self, prompt: str) -> None:
+    def run_send(self, prompt: str, attachments: list[dict[str, Any]]) -> None:
         rendered = ""
 
         def register_connection(connection: Any) -> None:
@@ -1006,7 +1119,11 @@ class ChatTui:
 
         try:
             result = self.send_prompt(
-                self.conversation_id, prompt, on_event, register_connection
+                self.conversation_id,
+                prompt,
+                attachments,
+                on_event,
+                register_connection,
             )
             self.conversation_id = result.get("conversation_id", self.conversation_id)
             conversation = result.get("conversation")
@@ -1033,6 +1150,7 @@ class ChatTui:
                         self.messages[-1]["text"] = final_text
             self.status = "Ready"
         except Exception as error:
+            self.pending_attachments[0:0] = attachments
             if not rendered:
                 with self.lock:
                     self.messages[-1]["text"] = f"*Request stopped: {error}*"
@@ -1065,6 +1183,7 @@ def run_tui(
     title: str = "New conversation",
     initial_messages: list[dict[str, Any]] | None = None,
     model: str | None = None,
+    upload_image: UploadImage | None = None,
 ) -> None:
     ChatTui(
         list_conversations,
@@ -1074,4 +1193,5 @@ def run_tui(
         title,
         initial_messages,
         model,
+        upload_image,
     ).run()

@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import fcntl
 from http.cookies import SimpleCookie
 import json
@@ -222,6 +223,9 @@ class ChatGPTWebClient:
     def request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
         for attempt in range(2):
             request_headers = self.headers.copy()
+            # httpx only decodes Brotli and Zstandard when optional packages are
+            # installed. Ask for encodings available in the minimal uv setup.
+            request_headers["accept-encoding"] = "gzip, deflate"
             target_path = urlsplit(url).path
             request_headers["x-openai-target-path"] = target_path
             request_headers["x-openai-target-route"] = target_path
@@ -301,8 +305,11 @@ class ChatGPTWebClient:
         self,
         conversation_id: str | None,
         prompt: str,
+        attachments: list[dict[str, Any]] | None = None,
         on_event: Any = None,
     ) -> tuple[str, dict[str, Any], set[str]]:
+        if attachments and os.environ.get("CHATGPT_WEB_SEND_MODE", "node") != "node":
+            raise ChatGPTWebError("image attachments require the direct node send mode")
         previous_ids: set[str] = set()
         previous: dict[str, Any] | None = None
         if conversation_id:
@@ -315,7 +322,9 @@ class ChatGPTWebClient:
                 }
 
         if os.environ.get("CHATGPT_WEB_SEND_MODE", "node") != "chrome":
-            resolved_id = self.send_prompt_direct(previous, prompt, on_event)
+            resolved_id = self.send_prompt_direct(
+                previous, prompt, attachments or [], on_event
+            )
             conversation = self.get_conversation(resolved_id)
             return resolved_id, conversation, previous_ids
 
@@ -379,6 +388,7 @@ class ChatGPTWebClient:
         self,
         conversation: dict[str, Any] | None,
         prompt: str,
+        attachments: list[dict[str, Any]],
         on_event: Any = None,
     ) -> str:
         conversation_id = None
@@ -407,7 +417,9 @@ class ChatGPTWebClient:
                 url = urljoin(CHATGPT_ORIGIN, "/backend-api/f/conversation")
                 headers = self.headers.copy()
                 headers.update(sentinel_headers)
-                body = self.create_conversation_body(conversation, prompt)
+                body = self.create_conversation_body(
+                    conversation, prompt, attachments
+                )
 
         headers.pop("x-openai-web-sse-compression", None)
         headers["x-openai-target-path"] = "/backend-api/f/conversation"
@@ -539,7 +551,10 @@ class ChatGPTWebClient:
         return result
 
     def create_conversation_body(
-        self, conversation: dict[str, Any] | None, prompt: str
+        self,
+        conversation: dict[str, Any] | None,
+        prompt: str,
+        attachments: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         parent = conversation.get("current_node") if conversation else None
         if not isinstance(parent, str) or not parent:
@@ -552,14 +567,53 @@ class ChatGPTWebClient:
             candidate = conversation.get("default_model_slug")
             if isinstance(candidate, str) and candidate:
                 model = candidate
+        attachments = attachments or []
+        content_parts: list[Any] = [prompt]
+        attachment_metadata: list[dict[str, Any]] = []
+        if attachments:
+            content_parts = []
+            for attachment in attachments:
+                file_id = attachment.get("id")
+                if not isinstance(file_id, str) or not file_id.startswith(
+                    ("file-", "file_")
+                ):
+                    raise ChatGPTWebError("invalid uploaded image ID")
+                size = attachment.get("size_bytes")
+                width = attachment.get("width")
+                height = attachment.get("height")
+                if not all(
+                    isinstance(value, int) and value > 0
+                    for value in (size, width, height)
+                ):
+                    raise ChatGPTWebError("invalid uploaded image dimensions")
+                content_parts.append({
+                    "content_type": "image_asset_pointer",
+                    "asset_pointer": f"file-service://{file_id}",
+                    "size_bytes": size,
+                    "width": width,
+                    "height": height,
+                })
+                attachment_metadata.append({
+                    "id": file_id,
+                    "name": attachment.get("name") or "clipboard.png",
+                    "mime_type": attachment.get("mime_type") or "image/png",
+                    "size": size,
+                    "width": width,
+                    "height": height,
+                })
+            content_parts.append(prompt)
         return {
             "action": "next",
             "messages": [{
                 "id": str(uuid.uuid4()),
                 "author": {"role": "user"},
                 "create_time": time.time(),
-                "content": {"content_type": "text", "parts": [prompt]},
+                "content": {
+                    "content_type": "multimodal_text" if attachments else "text",
+                    "parts": content_parts,
+                },
                 "metadata": {
+                    "attachments": attachment_metadata,
                     "selected_sources": [],
                     "serialization_metadata": {"custom_symbol_offsets": []},
                     "submission_mode": "manual_send",
@@ -579,6 +633,54 @@ class ChatGPTWebClient:
             "force_parallel_switch": "auto",
             "thinking_effort": "extended",
             "local_function_names": ["local.continue_in_work"],
+        }
+
+    def upload_image(
+        self,
+        file_name: str,
+        mime_type: str,
+        data: bytes,
+        width: int,
+        height: int,
+    ) -> dict[str, Any]:
+        if mime_type != "image/png" or not data.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise ChatGPTWebError("only PNG clipboard images are currently supported")
+        if not data or len(data) > 20 * 1024 * 1024:
+            raise ChatGPTWebError("clipboard image must be smaller than 20 MiB")
+        slot = self.request(
+            "POST",
+            urljoin(CHATGPT_ORIGIN, "/backend-api/files"),
+            json={
+                "file_name": file_name,
+                "file_size": len(data),
+                "use_case": "multimodal",
+            },
+        ).json()
+        file_id = slot.get("file_id")
+        upload_url = slot.get("upload_url")
+        if not isinstance(file_id, str) or not isinstance(upload_url, str):
+            raise ChatGPTWebError("ChatGPT returned an invalid image upload slot")
+        upload = self.http.put(
+            upload_url,
+            content=data,
+            headers={"content-type": mime_type, "x-ms-blob-type": "BlockBlob"},
+            timeout=60,
+        )
+        upload.raise_for_status()
+        finalized = self.request(
+            "POST",
+            urljoin(CHATGPT_ORIGIN, f"/backend-api/files/{file_id}/uploaded"),
+            json={},
+        ).json()
+        if finalized.get("status") != "success":
+            raise ChatGPTWebError("ChatGPT did not finalize the image upload")
+        return {
+            "id": file_id,
+            "name": file_name,
+            "mime_type": mime_type,
+            "size_bytes": len(data),
+            "width": width,
+            "height": height,
         }
 
     def capture_send_recipe(
@@ -950,6 +1052,7 @@ def run_fullscreen(
     def send(
         selected_id: str | None,
         prompt: str,
+        attachments: list[dict[str, Any]],
         on_event: Any,
         on_connection: Any,
     ) -> dict[str, Any]:
@@ -957,16 +1060,28 @@ def run_fullscreen(
             "command": "send_stream",
             "conversation_id": selected_id,
             "prompt": prompt,
+            "attachments": attachments,
         }, on_event, on_connection)
+
+    def upload_image(
+        data: bytes, file_name: str, mime_type: str, width: int, height: int
+    ) -> dict[str, Any]:
+        return daemon_request(socket_path, {
+            "command": "upload_image",
+            "data": base64.b64encode(data).decode("ascii"),
+            "file_name": file_name,
+            "mime_type": mime_type,
+            "width": width,
+            "height": height,
+        }).get("attachment", {})
 
     run_tui(
         list_recent,
         load,
         send,
-        conversation_id,
-        "Loading conversation" if conversation_id else "New conversation",
-        None,
-        None,
+        conversation_id=conversation_id,
+        title="Loading conversation" if conversation_id else "New conversation",
+        upload_image=upload_image,
     )
     return 0
 
@@ -1195,18 +1310,42 @@ def handle_daemon_command(
     if command == "send":
         conversation_id = request.get("conversation_id")
         prompt = request.get("prompt")
+        attachments = request.get("attachments", [])
         if conversation_id is not None and not isinstance(conversation_id, str):
             raise ChatGPTWebError("invalid conversation ID")
-        if not isinstance(prompt, str) or not prompt.strip():
-            raise ChatGPTWebError("prompt must not be empty")
+        if not isinstance(prompt, str) or (not prompt.strip() and not attachments):
+            raise ChatGPTWebError("prompt or attachment is required")
+        if not isinstance(attachments, list):
+            raise ChatGPTWebError("invalid attachment list")
         resolved_id, conversation, previous_ids = client.send_prompt(
-            conversation_id, prompt
+            conversation_id, prompt, attachments
         )
         return {
             "conversation_id": resolved_id,
             "conversation": conversation,
             "previous_ids": sorted(previous_ids),
         }, False
+    if command == "upload_image":
+        encoded = request.get("data")
+        file_name = request.get("file_name")
+        mime_type = request.get("mime_type")
+        width = request.get("width")
+        height = request.get("height")
+        if not isinstance(encoded, str) or not isinstance(file_name, str):
+            raise ChatGPTWebError("invalid image upload request")
+        if (
+            mime_type != "image/png"
+            or not isinstance(width, int)
+            or not isinstance(height, int)
+        ):
+            raise ChatGPTWebError("invalid image upload metadata")
+        try:
+            data = base64.b64decode(encoded, validate=True)
+        except ValueError as error:
+            raise ChatGPTWebError("invalid image upload data") from error
+        return {"attachment": client.upload_image(
+            file_name, mime_type, data, width, height
+        )}, False
     if command == "stop":
         return {"stopping": True}, True
     raise ChatGPTWebError(f"unknown daemon command: {command}")
@@ -1254,15 +1393,21 @@ def run_daemon(socket_path: Path, cdp_url: str) -> int:
                         if request.get("command") == "send_stream":
                             conversation_id = request.get("conversation_id")
                             prompt = request.get("prompt")
+                            attachments = request.get("attachments", [])
                             if conversation_id is not None and not isinstance(
                                 conversation_id, str
                             ):
                                 raise ChatGPTWebError("invalid conversation ID")
-                            if not isinstance(prompt, str) or not prompt.strip():
-                                raise ChatGPTWebError("prompt must not be empty")
+                            if not isinstance(prompt, str) or (
+                                not prompt.strip() and not attachments
+                            ):
+                                raise ChatGPTWebError("prompt or attachment is required")
+                            if not isinstance(attachments, list):
+                                raise ChatGPTWebError("invalid attachment list")
                             resolved_id, conversation, previous_ids = client.send_prompt(
                                 conversation_id,
                                 prompt,
+                                attachments,
                                 lambda event: send_json_line(connection, {
                                     "ok": True, "event": event,
                                 }),

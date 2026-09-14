@@ -24,6 +24,7 @@ home beside modern coding agents.
 - 🧠 **Persistent authentication** after a one-time interactive Chrome login
 - 🚀 **Browserless operation** after authentication, including write signing
 - 🎨 **Rich Markdown** with syntax-highlighted fenced code blocks
+- 🖼️ **Clipboard images** uploaded and attached directly from the composer
 - 📜 **Native terminal scrollback** bounded to the current session
 - 🧹 **Clean history rendering** that hides internal tool-protocol payloads
 - 📋 **Clipboard support** through `/copy`
@@ -37,6 +38,7 @@ home beside modern coding agents.
 - [`uv`](https://docs.astral.sh/uv/) (recommended), or `pip`
 - Node.js 22+
 - Chrome or Chromium for the initial login
+- `wl-paste` (Wayland), `xclip` (X11), or `pngpaste` (macOS) for image paste
 
 ```bash
 git clone https://github.com/tritao/chatgpt-web.git
@@ -67,6 +69,7 @@ ln -s "$(pwd)/run" ~/.local/bin/chatgpt-web
 | `Enter` | Send the prompt |
 | `Alt+Enter` | Insert a newline |
 | `Ctrl+R` | Open the searchable conversation picker |
+| `Ctrl+V` | Attach a PNG image from the clipboard |
 | `Ctrl+C` | Stop an active response |
 | `Ctrl+D` | Exit from an empty prompt |
 | `PageUp` / `PageDown` | Move through the transcript |
@@ -83,6 +86,7 @@ Type `/` to open command completion:
 | `/resume ID` | Open a conversation directly |
 | `/history` | Reload the current conversation |
 | `/copy` | Copy the latest assistant response |
+| `/remove` | Remove the latest pending image |
 | `/clear` | Clear the displayed transcript |
 | `/help` | Show command help |
 | `/exit`, `/quit` | Exit the client |
