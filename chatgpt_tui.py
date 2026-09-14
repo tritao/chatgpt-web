@@ -106,6 +106,7 @@ class SlashCommandCompleter(Completer):
         ("/clear", "clear the displayed transcript"),
         ("/help", "show available commands"),
         ("/exit", "quit chatgpt-web"),
+        ("/quit", "quit chatgpt-web"),
     )
 
     def get_completions(self, document: Any, complete_event: Any) -> Any:
@@ -811,7 +812,7 @@ class ChatTui:
                 "- `/history` reload this conversation\n"
                 "- `/copy` copy the latest assistant response\n"
                 "- `/clear` clear the displayed transcript\n"
-                "- `/exit` quit"
+                "- `/exit` or `/quit` quit"
             )
         else:
             self.status = f"Unknown command: {name}"

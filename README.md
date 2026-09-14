@@ -67,7 +67,7 @@ scroll the transcript. New output follows the bottom automatically; PageUp
 pauses following and End resumes it. `/resume` or Ctrl+R opens a centered,
 searchable list of recent conversations; use Up/Down, Enter, and Escape to navigate it. Commands
 also include `/new`, `/resume ID`, `/history`, `/copy`, `/clear`, `/help`, and
-`/exit`. `/copy` copies the latest assistant response to the system clipboard.
+`/exit` or `/quit`. `/copy` copies the latest assistant response to the system clipboard.
 Typing `/` opens the command menu; use Up/Down and Tab or Enter to complete a
 command, then Enter to run it.
 `chatgpt-web resume CONVERSATION_ID` opens an existing conversation directly in
