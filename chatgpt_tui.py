@@ -262,6 +262,7 @@ class ChatTui:
         self.formatted_transcript_source = ""
         self.formatted_transcript: ANSI = ANSI("")
         self.committed_message_count = 0
+        self.history_tail = ""
         self.event_loop: asyncio.AbstractEventLoop | None = None
 
         self.transcript_control = FormattedTextControl(
@@ -444,8 +445,8 @@ class ChatTui:
         width = self.transcript_width()
         if not messages:
             if self.committed_message_count:
-                self.transcript_line_count = 1
-                return ""
+                self.transcript_line_count = self.history_tail.count("\n") + 1
+                return self.history_tail
             buffer = StringIO()
             console = Console(
                 file=buffer,
@@ -457,14 +458,15 @@ class ChatTui:
             console.print(Text("Start a conversation below.", style="dim"))
             rendered = buffer.getvalue()
         else:
-            pieces = []
+            pieces = [self.history_tail] if self.history_tail else []
         for index, message in enumerate(messages):
             role = message["role"]
             text = render_chatgpt_annotations(message["text"])
             active = self.busy and index == len(messages) - 1 and role == "assistant"
-            key = (role, text, width, index > 0)
+            separated = index > 0 or bool(self.history_tail)
+            key = (role, text, width, separated)
             if active or key not in self.render_cache:
-                value = self.render_message(role, text, width, index > 0, active)
+                value = self.render_message(role, text, width, separated, active)
                 if not active:
                     if len(self.render_cache) > 256:
                         self.render_cache.clear()
@@ -501,16 +503,25 @@ class ChatTui:
         sys.stdout.write(rendered)
         sys.stdout.flush()
 
+    def retain_history_tail(self, rendered: str) -> None:
+        transcript_rows = max(1, self.viewport_height().preferred - 5)
+        self.history_tail = "".join(
+            rendered.splitlines(keepends=True)[-transcript_rows:]
+        )
+
     def commit_initial_history(self) -> None:
         with self.lock:
             messages = [dict(message) for message in self.messages]
         if not messages:
             return
-        self.write_terminal_history(self.render_history(messages))
+        rendered = self.render_history(messages)
+        self.write_terminal_history(rendered)
+        self.retain_history_tail(rendered)
         self.committed_message_count = len(messages)
 
     def commit_loaded_history(self, messages: list[Message]) -> None:
         rendered = self.render_history(messages)
+        self.retain_history_tail(rendered)
         self.committed_message_count = len(messages)
 
         def schedule_write() -> None:
@@ -543,6 +554,7 @@ class ChatTui:
         if not messages:
             return
         rendered = self.render_history(messages)
+        self.retain_history_tail(self.history_tail + rendered)
 
         def schedule_write() -> None:
             future = run_in_terminal(
@@ -790,6 +802,7 @@ class ChatTui:
             with self.lock:
                 self.messages.clear()
                 self.committed_message_count = 0
+                self.history_tail = ""
             self.conversation_id = None
             self.title = "New conversation"
             self.status = "Started a new conversation"
@@ -798,6 +811,7 @@ class ChatTui:
             with self.lock:
                 self.messages.clear()
                 self.committed_message_count = 0
+                self.history_tail = ""
             self.status = "Transcript cleared"
             self.scroll_bottom()
         elif name == "/resume":
