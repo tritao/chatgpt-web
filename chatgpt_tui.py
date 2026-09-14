@@ -12,6 +12,7 @@ from datetime import datetime
 from typing import Any, Callable
 
 from prompt_toolkit.application import Application
+from prompt_toolkit.auto_suggest import AutoSuggest, Suggestion
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.formatted_text import ANSI, FormattedText
@@ -64,6 +65,13 @@ class SlashCommandCompleter(Completer):
                     display=command,
                     display_meta=description,
                 )
+
+
+class ComposerPlaceholder(AutoSuggest):
+    def get_suggestion(self, buffer: Any, document: Any) -> Suggestion | None:
+        if not document.text:
+            return Suggestion("Ask ChatGPT anything")
+        return None
 
 
 def render_chatgpt_annotations(text: str) -> str:
@@ -148,7 +156,7 @@ class ChatTui:
             allow_scroll_beyond_bottom=False,
         )
         self.input = TextArea(
-            height=D(min=3, max=8),
+            height=D(min=1, max=6),
             multiline=True,
             wrap_lines=True,
             prompt=self.render_prompt,
@@ -156,6 +164,7 @@ class ChatTui:
             dont_extend_height=True,
             completer=SlashCommandCompleter(),
             complete_while_typing=True,
+            auto_suggest=ComposerPlaceholder(),
             style="class:composer",
         )
         self.resume_search = TextArea(
@@ -181,7 +190,9 @@ class ChatTui:
                 content=FormattedTextControl(self.render_activity),
                 style="class:activity",
             ),
+            Window(height=1, char=" ", style="class:composer"),
             self.input,
+            Window(height=1, char=" ", style="class:composer"),
             Window(
                 height=1,
                 content=FormattedTextControl(self.render_metadata),
@@ -236,7 +247,7 @@ class ChatTui:
                 "activity": "#9ca3af",
                 "composer": "bg:#4b4b4b #f9fafb",
                 "prompt": "bg:#4b4b4b bold #f9fafb",
-                "placeholder": "bg:#4b4b4b #d1d5db",
+                "auto-suggestion": "bg:#4b4b4b #9ca3af",
                 "metadata": "bg:#272727 #9ca3af",
                 "metadata.model": "bg:#272727 #fbbf24",
                 "metadata.ready": "bg:#272727 #86efac",
@@ -255,11 +266,6 @@ class ChatTui:
         )
 
     def render_prompt(self) -> FormattedText:
-        if not self.input.text:
-            return FormattedText([
-                ("class:prompt", " › "),
-                ("class:placeholder", "Ask ChatGPT anything "),
-            ])
         return FormattedText([("class:prompt", " › ")])
 
     @staticmethod
@@ -397,6 +403,10 @@ class ChatTui:
 
     def make_bindings(self) -> KeyBindings:
         bindings = KeyBindings()
+        completion_visible = Condition(
+            lambda: self.app.layout.current_control is self.input.control
+            and self.input.buffer.complete_state is not None
+        )
 
         @bindings.add("enter")
         def submit(event: Any) -> None:
@@ -418,6 +428,10 @@ class ChatTui:
                 self.input.buffer.apply_completion(completion)
             else:
                 self.input.buffer.start_completion(select_first=True)
+
+        @bindings.add("escape", filter=completion_visible, eager=True)
+        def dismiss_completion(_event: Any) -> None:
+            self.input.buffer.cancel_completion()
 
         @bindings.add("escape", "enter")
         def newline(event: Any) -> None:
