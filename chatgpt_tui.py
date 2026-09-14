@@ -258,7 +258,6 @@ class ChatTui:
             multiline=True,
             wrap_lines=True,
             prompt=self.render_prompt,
-            read_only=Condition(lambda: self.busy),
             dont_extend_height=True,
             completer=SlashCommandCompleter(),
             complete_while_typing=True,
@@ -339,6 +338,8 @@ class ChatTui:
             key_bindings=self.bindings,
             full_screen=False,
             mouse_support=False,
+            min_redraw_interval=0.05,
+            max_render_postpone_time=0.1,
             refresh_interval=0.12,
             style=Style.from_dict({
                 "separator": "#6b7280",
@@ -697,6 +698,8 @@ class ChatTui:
 
     def submit_prompt(self) -> None:
         if self.busy:
+            self.status = "Response active · draft kept for the next turn"
+            self.app.invalidate()
             return
         prompt = self.input.text.strip()
         if not prompt:
