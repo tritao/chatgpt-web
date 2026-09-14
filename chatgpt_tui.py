@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from io import StringIO
 import base64
 import os
@@ -9,12 +10,13 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from datetime import datetime
 from typing import Any, Callable
 
-from prompt_toolkit.application import Application
+from prompt_toolkit.application import Application, run_in_terminal
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.formatted_text import ANSI, FormattedText
@@ -236,6 +238,8 @@ class ChatTui:
         self.render_cache: dict[tuple[str, str, int, bool], str] = {}
         self.formatted_transcript_source = ""
         self.formatted_transcript: ANSI = ANSI("")
+        self.committed_message_count = 0
+        self.event_loop: asyncio.AbstractEventLoop | None = None
 
         self.transcript_control = FormattedTextControl(
             text=self.render_formatted_transcript,
@@ -398,14 +402,15 @@ class ChatTui:
 
     def render_transcript(self) -> str:
         with self.lock:
-            messages = [dict(message) for message in self.messages]
-        width = 100
-        if hasattr(self, "app"):
-            try:
-                width = max(40, self.app.output.get_size().columns - 3)
-            except Exception:
-                pass
+            messages = [
+                dict(message)
+                for message in self.messages[self.committed_message_count:]
+            ]
+        width = self.transcript_width()
         if not messages:
+            if self.committed_message_count:
+                self.transcript_line_count = 1
+                return ""
             buffer = StringIO()
             console = Console(
                 file=buffer,
@@ -436,6 +441,57 @@ class ChatTui:
             rendered = "".join(pieces)
         self.transcript_line_count = rendered.count("\n") + 1
         return rendered
+
+    def transcript_width(self) -> int:
+        try:
+            return max(40, self.app.output.get_size().columns - 3)
+        except Exception:
+            return max(40, shutil.get_terminal_size((100, 24)).columns - 3)
+
+    def render_history(self, messages: list[Message]) -> str:
+        width = self.transcript_width()
+        return "".join(
+            self.render_message(
+                message["role"],
+                render_chatgpt_annotations(message["text"]),
+                width,
+                index > 0,
+                False,
+            )
+            for index, message in enumerate(messages)
+        )
+
+    @staticmethod
+    def write_terminal_history(rendered: str) -> None:
+        sys.stdout.write(rendered)
+        sys.stdout.flush()
+
+    def commit_initial_history(self) -> None:
+        with self.lock:
+            messages = [dict(message) for message in self.messages]
+        if not messages:
+            return
+        self.write_terminal_history(self.render_history(messages))
+        self.committed_message_count = len(messages)
+
+    def commit_loaded_history(self, messages: list[Message]) -> None:
+        rendered = self.render_history(messages)
+        self.committed_message_count = len(messages)
+
+        def schedule_write() -> None:
+            future = run_in_terminal(
+                lambda: self.write_terminal_history(rendered),
+                render_cli_done=False,
+            )
+
+            def finished(_future: Any) -> None:
+                self.status = "Ready"
+                self.scroll_bottom()
+
+            future.add_done_callback(finished)
+
+        if self.event_loop is not None:
+            self.event_loop.call_soon_threadsafe(schedule_write)
 
     def render_formatted_transcript(self) -> ANSI:
         rendered = self.render_transcript()
@@ -666,6 +722,7 @@ class ChatTui:
         elif name == "/new":
             with self.lock:
                 self.messages.clear()
+                self.committed_message_count = 0
             self.conversation_id = None
             self.title = "New conversation"
             self.status = "Started a new conversation"
@@ -673,6 +730,7 @@ class ChatTui:
         elif name == "/clear":
             with self.lock:
                 self.messages.clear()
+                self.committed_message_count = 0
             self.status = "Transcript cleared"
             self.scroll_bottom()
         elif name == "/resume":
@@ -824,8 +882,7 @@ class ChatTui:
                     self.messages = messages
                 self.conversation_id = conversation_id
                 self.title = conversation.get("title") or "Untitled"
-                self.status = "Ready"
-                self.scroll_bottom()
+                self.commit_loaded_history(messages)
             except Exception as error:
                 self.status = f"Load failed: {error}"
                 self.app.invalidate()
@@ -895,7 +952,12 @@ class ChatTui:
             self.scroll_bottom(force=False)
 
     def run(self) -> None:
-        self.app.run()
+        self.commit_initial_history()
+
+        def started() -> None:
+            self.event_loop = asyncio.get_running_loop()
+
+        self.app.run(pre_run=started)
 
 
 def run_tui(
