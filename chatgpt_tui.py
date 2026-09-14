@@ -12,6 +12,7 @@ from datetime import datetime
 from typing import Any, Callable
 
 from prompt_toolkit.application import Application
+from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.formatted_text import ANSI, FormattedText
 from prompt_toolkit.key_binding import KeyBindings
@@ -19,6 +20,7 @@ from prompt_toolkit.layout import Float, FloatContainer, HSplit, Layout, Window
 from prompt_toolkit.layout.containers import ConditionalContainer
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.layout.dimension import D
+from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.styles import Style
 from prompt_toolkit.data_structures import Point
 from prompt_toolkit.widgets import Frame, TextArea
@@ -37,6 +39,31 @@ SendPrompt = Callable[
 ]
 
 ANNOTATION_PATTERN = re.compile(r"\ue200([^\ue201\ue202]+)(?:\ue202(.*?))?\ue201")
+
+
+class SlashCommandCompleter(Completer):
+    COMMANDS = (
+        ("/new", "start a new conversation"),
+        ("/resume", "search recent conversations"),
+        ("/history", "reload this conversation"),
+        ("/clear", "clear the displayed transcript"),
+        ("/help", "show available commands"),
+        ("/exit", "quit chatgpt-web"),
+    )
+
+    def get_completions(self, document: Any, complete_event: Any) -> Any:
+        token = document.text_before_cursor
+        if not token.startswith("/") or any(char.isspace() for char in token):
+            return
+        query = token.casefold()
+        for command, description in self.COMMANDS:
+            if command.startswith(query) and command != query:
+                yield Completion(
+                    command,
+                    start_position=-len(token),
+                    display=command,
+                    display_meta=description,
+                )
 
 
 def render_chatgpt_annotations(text: str) -> str:
@@ -121,12 +148,14 @@ class ChatTui:
             allow_scroll_beyond_bottom=False,
         )
         self.input = TextArea(
-            height=D(min=1, max=7),
+            height=D(min=3, max=8),
             multiline=True,
             wrap_lines=True,
             prompt=self.render_prompt,
             read_only=Condition(lambda: self.busy),
             dont_extend_height=True,
+            completer=SlashCommandCompleter(),
+            complete_while_typing=True,
             style="class:composer",
         )
         self.resume_search = TextArea(
@@ -152,7 +181,6 @@ class ChatTui:
                 content=FormattedTextControl(self.render_activity),
                 style="class:activity",
             ),
-            Window(height=1, char="─", style="class:separator"),
             self.input,
             Window(
                 height=1,
@@ -180,13 +208,22 @@ class ChatTui:
         )
         root = FloatContainer(
             content=base,
-            floats=[Float(
-                content=resume_dialog,
-                left=4,
-                right=4,
-                top=2,
-                bottom=2,
-            )],
+            floats=[
+                Float(
+                    xcursor=True,
+                    ycursor=True,
+                    attach_to_window=self.input.window,
+                    allow_cover_cursor=True,
+                    content=CompletionsMenu(max_height=8, scroll_offset=1),
+                ),
+                Float(
+                    content=resume_dialog,
+                    left=4,
+                    right=4,
+                    top=2,
+                    bottom=2,
+                ),
+            ],
         )
         self.app: Application[Any] = Application(
             layout=Layout(root, focused_element=self.input),
@@ -209,6 +246,11 @@ class ChatTui:
                 "resume.selected": "bg:#0f766e #ffffff bold",
                 "resume.item": "#d1d5db",
                 "resume.time": "#9ca3af",
+                "completion-menu": "bg:#303030 #e5e7eb",
+                "completion-menu.completion": "bg:#303030 #e5e7eb",
+                "completion-menu.completion.current": "bg:#0f766e #ffffff bold",
+                "completion-menu.meta.completion": "bg:#303030 #9ca3af",
+                "completion-menu.meta.completion.current": "bg:#0f766e #ccfbf1",
             }),
         )
 
@@ -359,7 +401,23 @@ class ChatTui:
         @bindings.add("enter")
         def submit(event: Any) -> None:
             if event.app.layout.current_control is self.input.control:
-                self.submit_prompt()
+                state = self.input.buffer.complete_state
+                if state is not None and state.completions:
+                    completion = state.current_completion or state.completions[0]
+                    self.input.buffer.apply_completion(completion)
+                else:
+                    self.submit_prompt()
+
+        @bindings.add("tab")
+        def complete_command(event: Any) -> None:
+            if event.app.layout.current_control is not self.input.control:
+                return
+            state = self.input.buffer.complete_state
+            if state is not None and state.completions:
+                completion = state.current_completion or state.completions[0]
+                self.input.buffer.apply_completion(completion)
+            else:
+                self.input.buffer.start_completion(select_first=True)
 
         @bindings.add("escape", "enter")
         def newline(event: Any) -> None:
