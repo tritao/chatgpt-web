@@ -17,6 +17,7 @@ from prompt_toolkit.layout.containers import ConditionalContainer
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.layout.dimension import D
 from prompt_toolkit.styles import Style
+from prompt_toolkit.data_structures import Point
 from prompt_toolkit.widgets import Frame, TextArea
 from rich.console import Console
 from rich.markdown import Markdown
@@ -96,10 +97,13 @@ class ChatTui:
         self.resume_filtered: list[dict[str, Any]] = []
         self.resume_index = 0
         self.resume_filter = Condition(lambda: self.resume_visible)
+        self.follow_output = True
+        self.transcript_line_count = 1
 
         self.transcript_control = FormattedTextControl(
             text=lambda: ANSI(self.render_transcript()),
             focusable=True,
+            get_cursor_position=self.transcript_cursor_position,
         )
         self.transcript_window = Window(
             content=self.transcript_control,
@@ -248,7 +252,14 @@ class ChatTui:
             else:
                 console.print(Text(role.title(), style="bold yellow"))
                 console.print(Markdown(text))
-        return buffer.getvalue()
+        rendered = buffer.getvalue()
+        self.transcript_line_count = rendered.count("\n") + 1
+        return rendered
+
+    def transcript_cursor_position(self) -> Point:
+        if self.follow_output:
+            return Point(x=0, y=max(0, self.transcript_line_count - 1))
+        return Point(x=0, y=max(0, self.transcript_window.vertical_scroll))
 
     def render_resume_list(self) -> FormattedText:
         if self.resume_loading:
@@ -338,13 +349,21 @@ class ChatTui:
 
         @bindings.add("pageup")
         def page_up(_event: Any) -> None:
+            self.follow_output = False
             self.transcript_window.vertical_scroll = max(
                 0, self.transcript_window.vertical_scroll - 10
             )
 
         @bindings.add("pagedown")
         def page_down(_event: Any) -> None:
+            self.follow_output = False
             self.transcript_window.vertical_scroll += 10
+
+        @bindings.add("end")
+        def follow_bottom(_event: Any) -> None:
+            self.follow_output = True
+            self.transcript_window.vertical_scroll = 10**9
+            self.app.invalidate()
 
         return bindings
 
@@ -353,8 +372,11 @@ class ChatTui:
             self.messages.append({"role": "system", "text": text})
         self.scroll_bottom()
 
-    def scroll_bottom(self) -> None:
-        self.transcript_window.vertical_scroll = 10**9
+    def scroll_bottom(self, force: bool = True) -> None:
+        if force:
+            self.follow_output = True
+        if self.follow_output:
+            self.transcript_window.vertical_scroll = 10**9
         self.app.invalidate()
 
     def submit_prompt(self) -> None:
@@ -516,7 +538,7 @@ class ChatTui:
             with self.lock:
                 self.messages[-1]["text"] = rendered
             self.status = "Streaming response…"
-            self.scroll_bottom()
+            self.scroll_bottom(force=False)
 
         try:
             result = self.send_prompt(
@@ -551,7 +573,7 @@ class ChatTui:
         finally:
             self.cancel_connection = None
             self.busy = False
-            self.scroll_bottom()
+            self.scroll_bottom(force=False)
 
     def run(self) -> None:
         self.app.run()
