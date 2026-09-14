@@ -510,11 +510,13 @@ class ChatTui:
         sys.stdout.write("\x1b[2J\x1b[3J\x1b[H")
         sys.stdout.flush()
 
-    def retain_history_tail(self, rendered: str) -> None:
+    def partition_history(self, rendered: str) -> str:
+        """Keep the newest viewport live and return older lines to commit."""
         transcript_rows = max(1, self.viewport_height().preferred - 5)
-        self.history_tail = "".join(
-            rendered.splitlines(keepends=True)[-transcript_rows:]
-        )
+        lines = rendered.splitlines(keepends=True)
+        split = max(0, len(lines) - transcript_rows)
+        self.history_tail = "".join(lines[split:])
+        return "".join(lines[:split])
 
     def commit_initial_history(self) -> None:
         with self.lock:
@@ -522,18 +524,18 @@ class ChatTui:
         if not messages:
             return
         rendered = self.render_history(messages)
-        self.write_terminal_history(rendered)
-        self.retain_history_tail(rendered)
+        committed = self.partition_history(rendered)
+        self.write_terminal_history(committed)
         self.committed_message_count = len(messages)
 
     def commit_loaded_history(self, messages: list[Message]) -> None:
         rendered = self.render_history(messages)
-        self.retain_history_tail(rendered)
+        committed = self.partition_history(rendered)
         self.committed_message_count = len(messages)
 
         def schedule_write() -> None:
             future = run_in_terminal(
-                lambda: self.write_terminal_history(rendered),
+                lambda: self.write_terminal_history(committed),
                 render_cli_done=False,
             )
 
@@ -561,11 +563,11 @@ class ChatTui:
         if not messages:
             return
         rendered = self.render_history(messages)
-        self.retain_history_tail(self.history_tail + rendered)
+        committed = self.partition_history(self.history_tail + rendered)
 
         def schedule_write() -> None:
             future = run_in_terminal(
-                lambda: self.write_terminal_history(rendered),
+                lambda: self.write_terminal_history(committed),
                 render_cli_done=False,
             )
             future.add_done_callback(lambda _future: self.scroll_bottom())
