@@ -280,22 +280,25 @@ class ChatTui:
             always_hide_cursor=True,
         )
         self.bindings = self.make_bindings()
-        base = HSplit([
-            self.transcript_window,
-            Window(
-                height=1,
-                content=FormattedTextControl(self.render_activity),
-                style="class:activity",
-            ),
-            Window(height=1, char=" ", style="class:composer"),
-            self.input,
-            Window(height=1, char=" ", style="class:composer"),
-            Window(
-                height=1,
-                content=FormattedTextControl(self.render_metadata),
-                style="class:metadata",
-            ),
-        ])
+        base = HSplit(
+            [
+                self.transcript_window,
+                Window(
+                    height=1,
+                    content=FormattedTextControl(self.render_activity),
+                    style="class:activity",
+                ),
+                Window(height=1, char=" ", style="class:composer"),
+                self.input,
+                Window(height=1, char=" ", style="class:composer"),
+                Window(
+                    height=1,
+                    content=FormattedTextControl(self.render_metadata),
+                    style="class:metadata",
+                ),
+            ],
+            height=self.viewport_height,
+        )
         resume_dialog = ConditionalContainer(
             content=Frame(
                 HSplit([
@@ -366,6 +369,13 @@ class ChatTui:
 
     def render_prompt(self) -> FormattedText:
         return FormattedText([("class:prompt", " › ")])
+
+    def viewport_height(self) -> D:
+        try:
+            rows = self.app.output.get_size().rows
+        except Exception:
+            rows = shutil.get_terminal_size((100, 24)).lines
+        return D.exact(max(6, rows))
 
     @staticmethod
     def format_elapsed(seconds: float) -> str:
