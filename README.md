@@ -7,6 +7,10 @@ the terminal: streaming answers, searchable history, Markdown rendering,
 syntax-highlighted code, native scrollback, and a bottom composer that feels at
 home beside modern coding agents.
 
+<p align="center">
+  <img src="docs/terminal-ui.png" alt="chatgpt-web terminal interface" width="974">
+</p>
+
 > [!IMPORTANT]
 > This is an experimental, unofficial client for undocumented ChatGPT web
 > endpoints. It may stop working when the web application changes. It is not an
