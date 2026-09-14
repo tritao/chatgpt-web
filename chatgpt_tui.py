@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from io import StringIO
+import re
 import threading
 from datetime import datetime
 from typing import Any, Callable
@@ -29,6 +30,39 @@ SendPrompt = Callable[
     [str | None, str, Callable[[dict[str, Any]], None], Callable[[Any], None]],
     dict[str, Any],
 ]
+
+ANNOTATION_PATTERN = re.compile(r"\ue200([^\ue201\ue202]+)(?:\ue202(.*?))?\ue201")
+
+
+def render_chatgpt_annotations(text: str) -> str:
+    """Turn ChatGPT web's private-use annotations into terminal-safe text."""
+
+    def replace(match: re.Match[str]) -> str:
+        kind = match.group(1).casefold()
+        fields = (match.group(2) or "").split("\ue202")
+        if kind == "filecite":
+            reference = next((field for field in fields if "file" in field), "")
+            location = next((field for field in fields if re.fullmatch(
+                r"L\d+(?:-L\d+)?", field
+            )), "")
+            file_match = re.search(r"file(\d+)", reference)
+            file_label = f"F{int(file_match.group(1)) + 1}" if file_match else "file"
+            location = location.replace("-", "–")
+            detail = f"{file_label}:{location}" if location else file_label
+            return f"[{detail}]"
+        if kind == "cite":
+            return "[source]"
+        # Image groups, navigation lists, entities, and other web-only widgets
+        # have no useful terminal payload in the marker itself.
+        return ""
+
+    rendered = ANNOTATION_PATTERN.sub(replace, text)
+    # Streaming can end between the opening marker and its terminator. Hide the
+    # incomplete suffix until the next delta completes it.
+    rendered = re.sub(r"\ue200[^\ue201]*$", "", rendered)
+    rendered = rendered.replace("\ue200", "").replace("\ue201", "").replace("\ue202", "")
+    rendered = re.sub(r"[ \t]+([,.;:!?])", r"\1", rendered)
+    return rendered
 
 
 class ChatTui:
@@ -201,7 +235,7 @@ class ChatTui:
             if index:
                 console.print()
             role = message["role"]
-            text = message["text"]
+            text = render_chatgpt_annotations(message["text"])
             if role == "user":
                 console.print(Text("You", style="bold cyan"))
                 console.print(Text(text, style="white"))
