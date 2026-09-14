@@ -26,8 +26,9 @@ from prompt_toolkit.styles import Style
 from prompt_toolkit.data_structures import Point
 from prompt_toolkit.widgets import Frame, TextArea
 from rich.console import Console
-from rich.markdown import Markdown
+from rich.markdown import CodeBlock, Markdown
 from rich.rule import Rule
+from rich.syntax import Syntax
 from rich.text import Text
 
 
@@ -40,6 +41,51 @@ SendPrompt = Callable[
 ]
 
 ANNOTATION_PATTERN = re.compile(r"\ue200([^\ue201\ue202]+)(?:\ue202(.*?))?\ue201")
+
+
+def detect_code_language(code: str) -> str:
+    """Choose a useful lexer for common unlabelled Markdown code blocks."""
+    stripped = code.lstrip()
+    if re.search(r"^(?:from\s+\w+\s+import|import\s+\w+|def\s+\w+|class\s+\w+)", stripped, re.M):
+        return "python"
+    if re.search(r"^(?:use\s+(?:std|crate)::|(?:pub\s+)?fn\s+\w+|impl(?:<.*?>)?\s+\w+)", stripped, re.M):
+        return "rust"
+    if re.search(r"\b(?:const|let|var)\s+\w+\s*=|=>|console\.\w+\(", code):
+        return "javascript"
+    if re.search(r"^\s*(?:SELECT|INSERT|UPDATE|DELETE|CREATE TABLE)\b", code, re.I | re.M):
+        return "sql"
+    if stripped.startswith(("#!/bin/sh", "#!/usr/bin/env bash", "#!/bin/bash")):
+        return "bash"
+    if stripped.startswith(("{", "[")):
+        try:
+            import json
+
+            json.loads(stripped)
+            return "json"
+        except ValueError:
+            pass
+    if re.search(r"</?[A-Za-z][^>]*>", code):
+        return "html"
+    if re.search(r"^\s*#include\s*[<\"]|\b(?:int|void|char)\s+\w+\s*\([^)]*\)\s*\{", code, re.M):
+        return "c"
+    return "text"
+
+
+class HighlightedCodeBlock(CodeBlock):
+    def __rich_console__(self, console: Console, options: Any) -> Any:
+        code = str(self.text).rstrip()
+        lexer = self.lexer_name
+        if lexer == "text":
+            lexer = detect_code_language(code)
+        yield Syntax(code, lexer, theme=self.theme, word_wrap=True, padding=1)
+
+
+class ChatMarkdown(Markdown):
+    elements = {
+        **Markdown.elements,
+        "fence": HighlightedCodeBlock,
+        "code_block": HighlightedCodeBlock,
+    }
 
 
 class SlashCommandCompleter(Completer):
@@ -322,6 +368,7 @@ class ChatTui:
                 file=buffer,
                 force_terminal=True,
                 color_system="truecolor",
+                no_color=False,
                 width=width,
             )
             console.print(Text("Start a conversation below.", style="dim"))
@@ -360,6 +407,7 @@ class ChatTui:
             file=buffer,
             force_terminal=True,
             color_system="truecolor",
+            no_color=False,
             width=width,
             soft_wrap=False,
         )
@@ -371,12 +419,12 @@ class ChatTui:
         elif role == "assistant":
             console.print(Text("• ", style="bold #86efac"), end="")
             if text:
-                console.print(Markdown(text, code_theme="monokai"))
+                console.print(ChatMarkdown(text, code_theme="monokai"))
             elif active:
                 console.print(Text("Thinking…", style="dim italic"))
         else:
             console.print(Text("• ", style="bold #fbbf24"), end="")
-            console.print(Markdown(text))
+            console.print(ChatMarkdown(text, code_theme="monokai"))
         console.print()
         return buffer.getvalue()
 
