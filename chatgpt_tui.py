@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from io import StringIO
+import os
+from pathlib import Path
 import re
 import threading
+import time
 from datetime import datetime
 from typing import Any, Callable
 
@@ -21,6 +24,7 @@ from prompt_toolkit.data_structures import Point
 from prompt_toolkit.widgets import Frame, TextArea
 from rich.console import Console
 from rich.markdown import Markdown
+from rich.rule import Rule
 from rich.text import Text
 
 
@@ -75,12 +79,14 @@ class ChatTui:
         conversation_id: str | None = None,
         title: str = "New conversation",
         initial_messages: list[dict[str, Any]] | None = None,
+        model: str | None = None,
     ) -> None:
         self.list_conversations = list_conversations
         self.load_conversation = load_conversation
         self.send_prompt = send_prompt
         self.conversation_id = conversation_id
         self.title = title
+        self.model = model or os.environ.get("CHATGPT_WEB_MODEL", "gpt-5-6-thinking")
         self.messages: list[Message] = []
         for message in initial_messages or []:
             role = message.get("role")
@@ -99,6 +105,9 @@ class ChatTui:
         self.resume_filter = Condition(lambda: self.resume_visible)
         self.follow_output = True
         self.transcript_line_count = 1
+        self.active_started: float | None = None
+        self.last_elapsed: float | None = None
+        self.render_cache: dict[tuple[str, str, int, bool], str] = {}
 
         self.transcript_control = FormattedTextControl(
             text=lambda: ANSI(self.render_transcript()),
@@ -112,11 +121,13 @@ class ChatTui:
             allow_scroll_beyond_bottom=False,
         )
         self.input = TextArea(
-            height=D(min=3, max=8),
+            height=D(min=1, max=7),
             multiline=True,
             wrap_lines=True,
-            prompt="❯ ",
+            prompt=self.render_prompt,
             read_only=Condition(lambda: self.busy),
+            dont_extend_height=True,
+            style="class:composer",
         )
         self.resume_search = TextArea(
             height=1,
@@ -135,26 +146,18 @@ class ChatTui:
         )
         self.bindings = self.make_bindings()
         base = HSplit([
-            Window(
-                height=1,
-                content=FormattedTextControl(self.render_header),
-                style="class:header",
-            ),
-            Window(height=1, char="─", style="class:separator"),
             self.transcript_window,
-            Window(height=1, char="─", style="class:separator"),
             Window(
                 height=1,
-                content=FormattedTextControl(self.render_status),
-                style="class:status",
+                content=FormattedTextControl(self.render_activity),
+                style="class:activity",
             ),
-            Frame(self.input, title="Prompt"),
+            Window(height=1, char="─", style="class:separator"),
+            self.input,
             Window(
                 height=1,
-                content=FormattedTextControl(
-                    text=" Enter send  Alt+Enter newline  Ctrl+R resume  Ctrl+C stop "
-                ),
-                style="class:help",
+                content=FormattedTextControl(self.render_metadata),
+                style="class:metadata",
             ),
         ])
         resume_dialog = ConditionalContainer(
@@ -190,12 +193,16 @@ class ChatTui:
             key_bindings=self.bindings,
             full_screen=True,
             mouse_support=True,
+            refresh_interval=0.12,
             style=Style.from_dict({
-                "header": "bg:#1f2937 #f9fafb",
-                "brand": "bold #5eead4",
-                "mode": "#9ca3af",
-                "separator": "#4b5563",
-                "status": "bg:#111827 #d1d5db",
+                "separator": "#6b7280",
+                "activity": "#9ca3af",
+                "composer": "bg:#4b4b4b #f9fafb",
+                "prompt": "bg:#4b4b4b bold #f9fafb",
+                "placeholder": "bg:#4b4b4b #d1d5db",
+                "metadata": "bg:#272727 #9ca3af",
+                "metadata.model": "bg:#272727 #fbbf24",
+                "metadata.ready": "bg:#272727 #86efac",
                 "help": "bg:#1f2937 #9ca3af",
                 "frame.label": "#5eead4",
                 "frame.border": "#4b5563",
@@ -205,16 +212,47 @@ class ChatTui:
             }),
         )
 
-    def render_header(self) -> FormattedText:
-        mode = "generating" if self.busy else "ready"
-        return FormattedText([
-            ("class:brand", " ChatGPT Web "),
-            ("", f"· {self.title} "),
-            ("class:mode", f"[{mode}]"),
-        ])
+    def render_prompt(self) -> FormattedText:
+        if not self.input.text:
+            return FormattedText([
+                ("class:prompt", " › "),
+                ("class:placeholder", "Ask ChatGPT anything "),
+            ])
+        return FormattedText([("class:prompt", " › ")])
 
-    def render_status(self) -> FormattedText:
-        return FormattedText([("", f" {self.status}")])
+    @staticmethod
+    def format_elapsed(seconds: float) -> str:
+        total = max(0, int(seconds))
+        if total < 60:
+            return f"{total}s"
+        return f"{total // 60}m {total % 60:02d}s"
+
+    def render_activity(self) -> FormattedText:
+        if self.busy and self.active_started is not None:
+            frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+            frame = frames[int((time.monotonic() - self.active_started) * 10) % len(frames)]
+            elapsed = self.format_elapsed(time.monotonic() - self.active_started)
+            return FormattedText([("", f" {frame} {self.status} · {elapsed} ")])
+        if self.status not in ("Ready", ""):
+            return FormattedText([("", f" • {self.status} ")])
+        if self.last_elapsed is not None:
+            return FormattedText([
+                ("", f" — Worked for {self.format_elapsed(self.last_elapsed)} "),
+            ])
+        return FormattedText([("", "")])
+
+    def render_metadata(self) -> FormattedText:
+        cwd = str(Path.cwd())
+        home = str(Path.home())
+        if cwd == home or cwd.startswith(home + os.sep):
+            cwd = "~" + cwd[len(home):]
+        state = "streaming" if self.busy else "ready"
+        title = self.title if len(self.title) <= 42 else self.title[:39] + "…"
+        return FormattedText([
+            ("class:metadata.model", f" {self.model} "),
+            ("class:metadata.ready", f"{state} "),
+            ("class:metadata", f"· {title} · {cwd} "),
+        ])
 
     def render_transcript(self) -> str:
         with self.lock:
@@ -225,6 +263,45 @@ class ChatTui:
                 width = max(40, self.app.output.get_size().columns - 3)
             except Exception:
                 pass
+        if not messages:
+            buffer = StringIO()
+            console = Console(
+                file=buffer,
+                force_terminal=True,
+                color_system="truecolor",
+                width=width,
+            )
+            console.print(Text("Start a conversation below.", style="dim"))
+            rendered = buffer.getvalue()
+        else:
+            pieces = []
+        for index, message in enumerate(messages):
+            role = message["role"]
+            text = render_chatgpt_annotations(message["text"])
+            active = self.busy and index == len(messages) - 1 and role == "assistant"
+            key = (role, text, width, index > 0)
+            if active or key not in self.render_cache:
+                value = self.render_message(role, text, width, index > 0, active)
+                if not active:
+                    if len(self.render_cache) > 256:
+                        self.render_cache.clear()
+                    self.render_cache[key] = value
+            else:
+                value = self.render_cache[key]
+            pieces.append(value)
+        if messages:
+            rendered = "".join(pieces)
+        self.transcript_line_count = rendered.count("\n") + 1
+        return rendered
+
+    def render_message(
+        self,
+        role: str,
+        text: str,
+        width: int,
+        separated: bool,
+        active: bool,
+    ) -> str:
         buffer = StringIO()
         console = Console(
             file=buffer,
@@ -233,28 +310,22 @@ class ChatTui:
             width=width,
             soft_wrap=False,
         )
-        if not messages:
-            console.print(Text("Start a conversation below.", style="dim"))
-        for index, message in enumerate(messages):
-            if index:
-                console.print()
-            role = message["role"]
-            text = render_chatgpt_annotations(message["text"])
-            if role == "user":
-                console.print(Text("You", style="bold cyan"))
-                console.print(Text(text, style="white"))
-            elif role == "assistant":
-                console.print(Text("ChatGPT", style="bold green"))
-                if text:
-                    console.print(Markdown(text, code_theme="monokai"))
-                elif self.busy:
-                    console.print(Text("Thinking…", style="dim italic"))
-            else:
-                console.print(Text(role.title(), style="bold yellow"))
-                console.print(Markdown(text))
-        rendered = buffer.getvalue()
-        self.transcript_line_count = rendered.count("\n") + 1
-        return rendered
+        if separated and role == "user":
+            console.print(Rule(style="#606060"))
+        if role == "user":
+            console.print(Text("› ", style="bold #67e8f9"), end="")
+            console.print(Text(text, style="#f3f4f6"))
+        elif role == "assistant":
+            console.print(Text("• ", style="bold #86efac"), end="")
+            if text:
+                console.print(Markdown(text, code_theme="monokai"))
+            elif active:
+                console.print(Text("Thinking…", style="dim italic"))
+        else:
+            console.print(Text("• ", style="bold #fbbf24"), end="")
+            console.print(Markdown(text))
+        console.print()
+        return buffer.getvalue()
 
     def transcript_cursor_position(self) -> Point:
         if self.follow_output:
@@ -393,6 +464,8 @@ class ChatTui:
             self.messages.append({"role": "user", "text": prompt})
             self.messages.append({"role": "assistant", "text": ""})
         self.busy = True
+        self.active_started = time.monotonic()
+        self.last_elapsed = None
         self.status = "Preparing secure request…"
         self.scroll_bottom()
         threading.Thread(target=self.run_send, args=(prompt,), daemon=True).start()
@@ -548,6 +621,9 @@ class ChatTui:
             conversation = result.get("conversation")
             if isinstance(conversation, dict):
                 self.title = conversation.get("title") or self.title
+                response_model = conversation.get("default_model_slug")
+                if isinstance(response_model, str) and response_model:
+                    self.model = response_model
                 previous_ids = set(result.get("previous_ids", []))
                 final_text = ""
                 for message in conversation.get("messages", []):
@@ -571,6 +647,9 @@ class ChatTui:
                     self.messages[-1]["text"] = f"*Request stopped: {error}*"
             self.status = "Response stopped"
         finally:
+            if self.active_started is not None:
+                self.last_elapsed = time.monotonic() - self.active_started
+            self.active_started = None
             self.cancel_connection = None
             self.busy = False
             self.scroll_bottom(force=False)
@@ -586,6 +665,7 @@ def run_tui(
     conversation_id: str | None = None,
     title: str = "New conversation",
     initial_messages: list[dict[str, Any]] | None = None,
+    model: str | None = None,
 ) -> None:
     ChatTui(
         list_conversations,
@@ -594,4 +674,5 @@ def run_tui(
         conversation_id,
         title,
         initial_messages,
+        model,
     ).run()

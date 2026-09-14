@@ -974,6 +974,7 @@ def run_fullscreen(
         conversation_id,
         conversation_title(initial or {}),
         (initial or {}).get("messages", []),
+        (initial or {}).get("model"),
     )
     return 0
 
