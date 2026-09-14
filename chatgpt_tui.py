@@ -41,6 +41,9 @@ SendPrompt = Callable[
 ]
 
 ANNOTATION_PATTERN = re.compile(r"\ue200([^\ue201\ue202]+)(?:\ue202(.*?))?\ue201")
+WRITING_DIRECTIVE_PATTERN = re.compile(
+    r'(?m)^[\ue200]?\s*:::writing\{(?P<attributes>[^}\n]*)\}\s*$'
+)
 
 
 def detect_code_language(code: str) -> str:
@@ -127,6 +130,15 @@ class ComposerPlaceholderProcessor(Processor):
 
 def render_chatgpt_annotations(text: str) -> str:
     """Turn ChatGPT web's private-use annotations into terminal-safe text."""
+
+    writing_directive = WRITING_DIRECTIVE_PATTERN.search(text)
+    if writing_directive:
+        attributes = writing_directive.group("attributes")
+        title_match = re.search(r'\btitle="([^"]+)"', attributes)
+        title = title_match.group(1) if title_match else "Document"
+        text = WRITING_DIRECTIVE_PATTERN.sub(f"**{title}**", text, count=1)
+        # The web client treats the matching container delimiter as metadata.
+        text = re.sub(r"(?m)^\s*:::\s*$", "", text)
 
     def replace(match: re.Match[str]) -> str:
         kind = match.group(1).casefold()
