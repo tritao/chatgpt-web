@@ -74,6 +74,7 @@ ln -s "$(pwd)/run" ~/.local/bin/chatgpt-web
 | `Ctrl+C` | Clear the prompt, or stop an active response |
 | `Ctrl+D` | Exit from an empty prompt |
 | `PageUp` / `PageDown` | Move through the transcript |
+| Mouse wheel | Scroll the transcript, including while a response is streaming |
 | `Home` / `End` | Move to the start or end of the current prompt line |
 | `End` outside the prompt | Follow new output at the bottom |
 | `Tab` / `Enter` | Accept a slash-command completion |

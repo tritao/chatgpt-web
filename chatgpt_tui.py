@@ -426,7 +426,7 @@ class ChatTui:
             layout=Layout(root, focused_element=self.input),
             key_bindings=self.bindings,
             full_screen=False,
-            mouse_support=False,
+            mouse_support=True,
             min_redraw_interval=0.05,
             max_render_postpone_time=0.1,
             refresh_interval=0.12,
