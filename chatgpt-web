@@ -329,10 +329,19 @@ class ChatGPTWebClient:
                 }
 
         if os.environ.get("CHATGPT_WEB_SEND_MODE", "node") != "chrome":
-            resolved_id = self.send_prompt_direct(
+            resolved_id, submitted_message_id = self.send_prompt_direct(
                 previous, prompt, attachments or [], on_event
             )
             conversation = self.get_conversation(resolved_id)
+            messages = conversation.get("messages", [])
+            attached = isinstance(messages, list) and any(
+                isinstance(message, dict) and message.get("id") == submitted_message_id
+                for message in messages
+            )
+            if not attached:
+                raise ChatGPTWebError(
+                    "ChatGPT did not attach the submitted message to the conversation"
+                )
             return resolved_id, conversation, previous_ids
 
         helper = Path(__file__).with_name("chrome-send.js")
@@ -397,7 +406,7 @@ class ChatGPTWebClient:
         prompt: str,
         attachments: list[dict[str, Any]],
         on_event: Any = None,
-    ) -> str:
+    ) -> tuple[str, str]:
         conversation_id = None
         if conversation:
             candidate = conversation.get("conversation_id") or conversation.get("id")
@@ -433,6 +442,9 @@ class ChatGPTWebClient:
         headers["x-openai-target-route"] = "/backend-api/f/conversation"
         body["supported_encodings"] = []
         body["supports_buffering"] = False
+        submitted_message_id = body.get("messages", [{}])[0].get("id")
+        if not isinstance(submitted_message_id, str) or not submitted_message_id:
+            raise ChatGPTWebError("conversation request has no user message ID")
         resolved_id: str | None = conversation_id
         rendered = ""
         with self.http.stream(
@@ -487,7 +499,7 @@ class ChatGPTWebClient:
                 rendered = text
         if not isinstance(resolved_id, str) or not resolved_id:
             raise ChatGPTWebError("ChatGPT did not return a conversation ID")
-        return resolved_id
+        return resolved_id, submitted_message_id
 
     def run_sentinel_node(
         self, arguments: list[str], payload: dict[str, Any] | None = None
