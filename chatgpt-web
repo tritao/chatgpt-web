@@ -609,7 +609,7 @@ class ChatGPTWebClient:
                     "height": height,
                 })
             content_parts.append(prompt)
-        return {
+        body = {
             "action": "next",
             "messages": [{
                 "id": str(uuid.uuid4()),
@@ -641,6 +641,11 @@ class ChatGPTWebClient:
             "thinking_effort": "extended",
             "local_function_names": ["local.continue_in_work"],
         }
+        if conversation:
+            conversation_id = conversation.get("conversation_id") or conversation.get("id")
+            if isinstance(conversation_id, str) and conversation_id:
+                body["conversation_id"] = conversation_id
+        return body
 
     def upload_image(
         self,
