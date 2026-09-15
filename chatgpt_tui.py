@@ -446,7 +446,9 @@ class ChatTui:
             layout=Layout(root, focused_element=self.input),
             key_bindings=self.bindings,
             full_screen=False,
-            mouse_support=True,
+            # Completed turns are written into the terminal's scrollback. Let
+            # the terminal keep wheel events so that history remains reachable.
+            mouse_support=False,
             min_redraw_interval=0.05,
             max_render_postpone_time=0.1,
             refresh_interval=0.12,
