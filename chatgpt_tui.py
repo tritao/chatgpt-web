@@ -38,6 +38,7 @@ from rich.segment import Segment
 from rich.style import Style as RichStyle
 from rich.syntax import Syntax
 from rich.text import Text
+from rich.theme import Theme
 
 
 Message = dict[str, str]
@@ -60,6 +61,25 @@ ANNOTATION_PATTERN = re.compile(r"\ue200([^\ue201\ue202]+)(?:\ue202(.*?))?\ue201
 WRITING_DIRECTIVE_PATTERN = re.compile(
     r'(?m)^[\ue200]?\s*:::writing\{(?P<attributes>[^}\n]*)\}\s*$'
 )
+
+MARKDOWN_THEME = Theme({
+    "markdown.text": "#e5e7eb",
+    "markdown.paragraph": "#e5e7eb",
+    "markdown.h1": "bold #f3f4f6",
+    "markdown.h2": "bold #f3f4f6",
+    "markdown.h3": "bold #f3f4f6",
+    "markdown.h4": "bold #e5e7eb",
+    "markdown.h5": "bold #d1d5db",
+    "markdown.h6": "bold #d1d5db",
+    "markdown.link": "underline #7dd3fc",
+    "markdown.link_url": "underline #7dd3fc",
+    "markdown.code": "bold #fbbf24",
+    "markdown.block_quote": "#9ca3af",
+    "markdown.hr": "#606060",
+    "markdown.list": "#e5e7eb",
+    "markdown.item.bullet": "bold #86efac",
+    "markdown.item.number": "bold #86efac",
+})
 
 
 def detect_code_language(code: str) -> str:
@@ -529,6 +549,7 @@ class ChatTui:
                 color_system="truecolor",
                 no_color=False,
                 width=width,
+                theme=MARKDOWN_THEME,
             )
             console.print(Text("Start a conversation below.", style="dim"))
             rendered = buffer.getvalue()
@@ -723,6 +744,7 @@ class ChatTui:
             no_color=False,
             width=width,
             soft_wrap=False,
+            theme=MARKDOWN_THEME,
         )
         if separated and role == "user":
             console.print(Rule(style="#606060"))
