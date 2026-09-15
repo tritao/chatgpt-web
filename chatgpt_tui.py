@@ -883,8 +883,20 @@ class ChatTui:
             self.pause_following()
             self.transcript_window.vertical_scroll += self.transcript_page_size()
 
-        @bindings.add("end")
-        def follow_bottom(_event: Any) -> None:
+        @bindings.add("home", eager=True)
+        def prompt_line_start(event: Any) -> None:
+            if event.app.layout.current_control is self.input.control:
+                self.input.buffer.cursor_position += (
+                    self.input.buffer.document.get_start_of_line_position()
+                )
+
+        @bindings.add("end", eager=True)
+        def prompt_line_end(event: Any) -> None:
+            if event.app.layout.current_control is self.input.control:
+                self.input.buffer.cursor_position += (
+                    self.input.buffer.document.get_end_of_line_position()
+                )
+                return
             self.follow_output = True
             self.transcript_window.vertical_scroll = 10**9
             self.app.invalidate()
