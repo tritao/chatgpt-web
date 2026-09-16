@@ -18,6 +18,7 @@ from http.cookies import SimpleCookie
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import shutil
 import socket
@@ -60,6 +61,91 @@ def auth_store_path() -> Path:
     state_home = os.environ.get("XDG_STATE_HOME")
     root = Path(state_home) if state_home else Path.home() / ".local" / "state"
     return root / "chatgpt-web" / "session.json"
+
+
+def conversation_cache_dir() -> Path:
+    data_home = os.environ.get("XDG_DATA_HOME")
+    root = Path(data_home) if data_home else Path.home() / ".local" / "share"
+    return root / "chatgpt-web" / "conversations"
+
+
+def conversation_cache_path(conversation_id: str) -> Path:
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", conversation_id):
+        raise ChatGPTWebError("invalid conversation ID")
+    return conversation_cache_dir() / f"{conversation_id}.json"
+
+
+def active_conversation_path() -> Path:
+    return conversation_cache_dir().parent / "active-conversation.json"
+
+
+def atomic_json_write(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, ensure_ascii=False, separators=(",", ":"))
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def set_active_conversation(conversation_id: str | None) -> None:
+    if conversation_id is None:
+        active_conversation_path().unlink(missing_ok=True)
+        return
+    conversation_cache_path(conversation_id)
+    atomic_json_write(active_conversation_path(), {"conversation_id": conversation_id})
+
+
+def cache_conversation(conversation: dict[str, Any], make_active: bool = True) -> dict[str, Any]:
+    raw_messages = conversation.get("messages")
+    already_normalized = (
+        isinstance(raw_messages, list)
+        and (not raw_messages or (
+            isinstance(raw_messages[0], dict)
+            and "role" in raw_messages[0]
+            and "author" not in raw_messages[0]
+        ))
+    )
+    normalized = dict(conversation) if already_normalized else normalize_conversation(conversation)
+    conversation_id = normalized.get("id")
+    if not isinstance(conversation_id, str) or not conversation_id:
+        raise ChatGPTWebError("conversation has no ID")
+    normalized["cached_at"] = time.time()
+    atomic_json_write(conversation_cache_path(conversation_id), normalized)
+    if make_active:
+        set_active_conversation(conversation_id)
+    return normalized
+
+
+def load_cached_conversation(conversation_id: str | None = None) -> dict[str, Any] | None:
+    if conversation_id is None:
+        try:
+            active = json.loads(active_conversation_path().read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        candidate = active.get("conversation_id") if isinstance(active, dict) else None
+        if not isinstance(candidate, str) or not candidate:
+            return None
+        conversation_id = candidate
+    try:
+        value = json.loads(conversation_cache_path(conversation_id).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def rename_cached_conversation(conversation_id: str, title: str) -> None:
+    cached = load_cached_conversation(conversation_id)
+    if cached is None:
+        return
+    cached["title"] = title
+    atomic_json_write(conversation_cache_path(conversation_id), cached)
 
 
 def sentinel_cache_status() -> dict[str, Any] | None:
@@ -1053,6 +1139,8 @@ def run_picker(socket_path: Path) -> int:
 def run_fullscreen(
     socket_path: Path,
     conversation_id: str | None = None,
+    cached_conversation: dict[str, Any] | None = None,
+    cdp_url: str = DEFAULT_CDP_URL,
 ) -> int:
     try:
         from chatgpt_tui import run_tui
@@ -1061,17 +1149,25 @@ def run_fullscreen(
             "fullscreen UI dependencies are missing; install chatgpt-web/requirements.txt"
         ) from error
 
+    def ensure_service() -> None:
+        ensure_daemon(socket_path, cdp_url)
+
     def list_recent() -> list[dict[str, Any]]:
+        ensure_service()
         items = daemon_request(socket_path, {
             "command": "list", "maximum": 50,
         }).get("items", [])
         return items if isinstance(items, list) else []
 
     def load(selected_id: str) -> dict[str, Any]:
+        ensure_service()
         raw = daemon_request(socket_path, {
             "command": "show_normalized", "conversation_id": selected_id,
         }).get("conversation", {})
-        return raw if isinstance(raw, dict) else {}
+        if isinstance(raw, dict):
+            cache_conversation(raw)
+            return raw
+        return {}
 
     def send(
         selected_id: str | None,
@@ -1080,16 +1176,22 @@ def run_fullscreen(
         on_event: Any,
         on_connection: Any,
     ) -> dict[str, Any]:
-        return daemon_stream_request(socket_path, {
+        ensure_service()
+        result = daemon_stream_request(socket_path, {
             "command": "send_stream",
             "conversation_id": selected_id,
             "prompt": prompt,
             "attachments": attachments,
         }, on_event, on_connection)
+        conversation = result.get("conversation")
+        if isinstance(conversation, dict):
+            cache_conversation(conversation)
+        return result
 
     def upload_image(
         data: bytes, file_name: str, mime_type: str, width: int, height: int
     ) -> dict[str, Any]:
+        ensure_service()
         return daemon_request(socket_path, {
             "command": "upload_image",
             "data": base64.b64encode(data).decode("ascii"),
@@ -1100,20 +1202,31 @@ def run_fullscreen(
         }).get("attachment", {})
 
     def rename(selected_id: str, new_title: str) -> None:
+        ensure_service()
         daemon_request(socket_path, {
             "command": "rename",
             "conversation_id": selected_id,
             "title": new_title,
         })
+        rename_cached_conversation(selected_id, new_title)
 
+    cached_id = cached_conversation.get("id") if cached_conversation else None
+    cached_messages = cached_conversation.get("messages") if cached_conversation else None
+    if isinstance(cached_id, str) and cached_id:
+        set_active_conversation(cached_id)
     run_tui(
         list_recent,
         load,
         send,
-        conversation_id=conversation_id,
-        title="Loading conversation" if conversation_id else "New conversation",
+        conversation_id=conversation_id or (cached_id if isinstance(cached_id, str) else None),
+        title=(cached_conversation.get("title") or "Untitled")
+              if cached_conversation else
+              ("Loading conversation" if conversation_id else "New conversation"),
+        initial_messages=cached_messages if isinstance(cached_messages, list) else None,
+        model=cached_conversation.get("model") if cached_conversation else None,
         upload_image=upload_image,
         rename_conversation=rename,
+        set_active_conversation=set_active_conversation,
     )
     return 0
 
@@ -1348,11 +1461,8 @@ def handle_daemon_command(
         conversation_id = request.get("conversation_id")
         if not isinstance(conversation_id, str) or not conversation_id:
             raise ChatGPTWebError("conversation ID is required")
-        return {
-            "conversation": normalize_conversation(
-                client.get_conversation(conversation_id)
-            )
-        }, False
+        conversation = client.get_conversation(conversation_id)
+        return {"conversation": cache_conversation(conversation)}, False
     if command == "rename":
         conversation_id = request.get("conversation_id")
         title = request.get("title")
@@ -1378,6 +1488,7 @@ def handle_daemon_command(
         resolved_id, conversation, previous_ids = client.send_prompt(
             conversation_id, prompt, attachments
         )
+        cache_conversation(conversation)
         return {
             "conversation_id": resolved_id,
             "conversation": conversation,
@@ -1470,6 +1581,7 @@ def run_daemon(socket_path: Path, cdp_url: str) -> int:
                                     "ok": True, "event": event,
                                 }),
                             )
+                            cache_conversation(conversation)
                             send_json_line(connection, {
                                 "ok": True,
                                 "result": {
@@ -1581,13 +1693,25 @@ def main() -> int:
             print(json.dumps({"logged_out": True}, separators=(",", ":")))
             return 0
 
-        ensure_daemon(args.socket, args.cdp_url)
         if args.command is None:
             if not sys.stdin.isatty():
                 raise ChatGPTWebError(
                     "interactive mode requires a terminal; use new or send for piped input"
                 )
-            return run_fullscreen(args.socket)
+            cached = load_cached_conversation()
+            return run_fullscreen(
+                args.socket, cached_conversation=cached, cdp_url=args.cdp_url
+            )
+        if args.command == "resume":
+            cached = load_cached_conversation(args.conversation_id)
+            return run_fullscreen(
+                args.socket,
+                args.conversation_id,
+                cached_conversation=cached,
+                cdp_url=args.cdp_url,
+            )
+
+        ensure_daemon(args.socket, args.cdp_url)
         if args.command == "auth":
             result = daemon_request(
                 args.socket, {"command": "auth", "refresh": args.refresh}
@@ -1631,8 +1755,6 @@ def main() -> int:
             )
             if args.command == "new" and args.output == "text":
                 print(f"\n[conversation {result.get('conversation_id')}]", file=sys.stderr)
-        elif args.command == "resume":
-            return run_fullscreen(args.socket, args.conversation_id)
 
     except KeyboardInterrupt:
         print("\n[interrupted]", file=sys.stderr)

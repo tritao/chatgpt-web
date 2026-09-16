@@ -56,6 +56,7 @@ SendPrompt = Callable[
 ]
 UploadImage = Callable[[bytes, str, str, int, int], dict[str, Any]]
 RenameConversation = Callable[[str, str], None]
+SetActiveConversation = Callable[[str | None], None]
 
 ANNOTATION_PATTERN = re.compile(r"\ue200([^\ue201\ue202]+)(?:\ue202(.*?))?\ue201")
 WRITING_DIRECTIVE_PATTERN = re.compile(
@@ -303,12 +304,14 @@ class ChatTui:
         model: str | None = None,
         upload_image: UploadImage | None = None,
         rename_conversation: RenameConversation | None = None,
+        set_active_conversation: SetActiveConversation | None = None,
     ) -> None:
         self.list_conversations = list_conversations
         self.load_conversation = load_conversation
         self.send_prompt = send_prompt
         self.upload_image = upload_image
         self.rename_conversation = rename_conversation
+        self.set_active_conversation = set_active_conversation
         self.conversation_id = conversation_id
         self.title = title
         self.model = model or os.environ.get("CHATGPT_WEB_MODEL", "gpt-5-6-thinking")
@@ -993,6 +996,8 @@ class ChatTui:
                 self.committed_message_count = 0
                 self.history_tail = ""
             self.conversation_id = None
+            if self.set_active_conversation is not None:
+                self.set_active_conversation(None)
             self.title = "New conversation"
             self.pending_attachments.clear()
             self.status = "Started a new conversation"
@@ -1260,6 +1265,8 @@ class ChatTui:
                 with self.lock:
                     self.messages = messages
                 self.conversation_id = conversation_id
+                if self.set_active_conversation is not None:
+                    self.set_active_conversation(conversation_id)
                 self.title = conversation.get("title") or "Untitled"
                 self.commit_loaded_history(messages)
             except Exception as error:
@@ -1300,6 +1307,8 @@ class ChatTui:
                 register_connection,
             )
             self.conversation_id = result.get("conversation_id", self.conversation_id)
+            if self.set_active_conversation is not None:
+                self.set_active_conversation(self.conversation_id)
             conversation = result.get("conversation")
             if isinstance(conversation, dict):
                 self.title = conversation.get("title") or self.title
@@ -1359,6 +1368,7 @@ def run_tui(
     model: str | None = None,
     upload_image: UploadImage | None = None,
     rename_conversation: RenameConversation | None = None,
+    set_active_conversation: SetActiveConversation | None = None,
 ) -> None:
     ChatTui(
         list_conversations,
@@ -1370,4 +1380,5 @@ def run_tui(
         model,
         upload_image,
         rename_conversation,
+        set_active_conversation,
     ).run()

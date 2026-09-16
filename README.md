@@ -22,6 +22,7 @@ home beside modern coding agents.
 - ⚡ **Streaming responses** with responsive input while generation continues
 - 🔎 **Searchable resume picker** for recent conversations
 - 🧠 **Persistent authentication** after a one-time interactive Chrome login
+- 💾 **Offline startup restore** from an atomic local conversation snapshot
 - 🚀 **Browserless operation** after authentication, including write signing
 - 🎨 **Rich Markdown** with syntax-highlighted fenced code blocks
 - 🖼️ **Clipboard images** uploaded and attached directly from the composer
@@ -55,6 +56,18 @@ cd chatgpt-web
 
 Chrome can be closed after `auth` succeeds. The local daemon persists the
 session and performs subsequent reads and writes without a running browser.
+
+The client caches each loaded or completed conversation under
+`$XDG_DATA_HOME/chatgpt-web/conversations` (normally
+`~/.local/share/chatgpt-web/conversations`). Reopening the terminal UI restores
+the last active conversation directly from that cache without starting the
+daemon or contacting ChatGPT. Network access begins only when you send a
+message or use a command that requests server data, such as `/resume` or
+`/history`. `/new` clears the active-conversation pointer.
+
+This also makes Sakura workspace restoration offline: Sakura already restores
+its ChatGPT tool tab by relaunching `chatgpt-web`, which now immediately replays
+the cached conversation.
 
 To make the command available everywhere:
 
