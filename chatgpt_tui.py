@@ -454,7 +454,6 @@ class ChatTui:
             mouse_support=False,
             min_redraw_interval=0.05,
             max_render_postpone_time=0.1,
-            refresh_interval=0.12,
             before_render=self.detect_terminal_resize,
             style=Style.from_dict({
                 "separator": "#6b7280",
@@ -478,6 +477,18 @@ class ChatTui:
                 "completion-menu.meta.completion.current": "bg:#0f766e #ccfbf1",
             }),
         )
+
+    async def animate_activity(self) -> None:
+        """Refresh animated status only while an operation is active.
+
+        A permanent prompt_toolkit refresh interval repaints the terminal even
+        when the UI is idle. Those writes clear native terminal selections,
+        making copied text lose its highlight almost immediately.
+        """
+        while True:
+            await asyncio.sleep(0.12)
+            if self.busy or self.loading_conversation or self.uploading_image:
+                self.app.invalidate()
 
     def render_prompt(self) -> FormattedText:
         return FormattedText([("class:prompt", " › ")])
@@ -1352,6 +1363,7 @@ class ChatTui:
 
         def started() -> None:
             self.event_loop = asyncio.get_running_loop()
+            self.app.create_background_task(self.animate_activity())
             if self.load_on_start and self.conversation_id is not None:
                 self.resume_conversation(self.conversation_id)
 
