@@ -59,6 +59,9 @@ RenameConversation = Callable[[str, str], None]
 SetActiveConversation = Callable[[str | None], None]
 
 ANNOTATION_PATTERN = re.compile(r"\ue200([^\ue201\ue202]+)(?:\ue202(.*?))?\ue201")
+FILE_CITATION_PATTERN = re.compile(
+    r"[ \t]*\[F\d+:L\d+(?:[ \t]*[-–—][ \t]*L?\d+)?\]"
+)
 WRITING_DIRECTIVE_PATTERN = re.compile(
     r'(?m)^[\ue200]?\s*:::writing\{(?P<attributes>[^}\n]*)\}\s*$'
 )
@@ -230,6 +233,8 @@ class TranscriptWindow(Window):
 def render_chatgpt_annotations(text: str) -> str:
     """Turn ChatGPT web's private-use annotations into terminal-safe text."""
 
+    hidden_citation = "\x00"
+
     writing_directive = WRITING_DIRECTIVE_PATTERN.search(text)
     if writing_directive:
         attributes = writing_directive.group("attributes")
@@ -241,24 +246,28 @@ def render_chatgpt_annotations(text: str) -> str:
 
     def replace(match: re.Match[str]) -> str:
         kind = match.group(1).casefold()
-        fields = (match.group(2) or "").split("\ue202")
         if kind == "filecite":
-            reference = next((field for field in fields if "file" in field), "")
-            location = next((field for field in fields if re.fullmatch(
-                r"L\d+(?:-L\d+)?", field
-            )), "")
-            file_match = re.search(r"file(\d+)", reference)
-            file_label = f"F{int(file_match.group(1)) + 1}" if file_match else "file"
-            location = location.replace("-", "–")
-            detail = f"{file_label}:{location}" if location else file_label
-            return f"[{detail}]"
+            return hidden_citation
         if kind == "cite":
-            return "[source]"
+            return hidden_citation
         # Image groups, navigation lists, entities, and other web-only widgets
         # have no useful terminal payload in the marker itself.
         return ""
 
     rendered = ANNOTATION_PATTERN.sub(replace, text)
+    def remove_hidden_citation(match: re.Match[str]) -> str:
+        left = rendered[match.start() - 1] if match.start() else "\n"
+        right = rendered[match.end()] if match.end() < len(rendered) else "\n"
+        return " " if left != "\n" and right != "\n" else ""
+
+    rendered = re.sub(
+        rf"[ \t]*{re.escape(hidden_citation)}[ \t]*",
+        remove_hidden_citation,
+        rendered,
+    )
+    # File citations are useful only when the client can resolve their hidden
+    # source metadata. Keep them in stored messages but omit them from display.
+    rendered = FILE_CITATION_PATTERN.sub("", rendered)
     # Some ChatGPT Web conversation nodes escape every Markdown delimiter in
     # otherwise complete Markdown. Only unescape after detecting a fenced block
     # so intentional backslashes in ordinary prose and source code survive.
