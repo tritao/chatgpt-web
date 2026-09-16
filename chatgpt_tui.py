@@ -72,14 +72,14 @@ MARKDOWN_THEME = Theme({
     "markdown.h4": "bold #e5e7eb",
     "markdown.h5": "bold #d1d5db",
     "markdown.h6": "bold #d1d5db",
-    "markdown.link": "underline #7dd3fc",
-    "markdown.link_url": "underline #7dd3fc",
-    "markdown.code": "bold #fbbf24",
+    "markdown.link": "underline #22d3ee",
+    "markdown.link_url": "underline #22d3ee",
+    "markdown.code": "#22d3ee",
     "markdown.block_quote": "#9ca3af",
     "markdown.hr": "#606060",
     "markdown.list": "#e5e7eb",
-    "markdown.item.bullet": "bold #86efac",
-    "markdown.item.number": "bold #86efac",
+    "markdown.item.bullet": "#e5e7eb",
+    "markdown.item.number": "#e5e7eb",
 })
 
 
@@ -763,7 +763,7 @@ class ChatTui:
                 )
             )
         elif role == "assistant":
-            console.print(Text("• ", style="bold #86efac"), end="")
+            console.print(Text("• ", style="#9ca3af"), end="")
             if text:
                 console.print(ChatMarkdown(text, code_theme="monokai"))
             elif active:
