@@ -62,6 +62,11 @@ ANNOTATION_PATTERN = re.compile(r"\ue200([^\ue201\ue202]+)(?:\ue202(.*?))?\ue201
 FILE_CITATION_PATTERN = re.compile(
     r"[ \t]*\[F\d+:L\d+(?:[ \t]*[-–—][ \t]*L?\d+)?\]"
 )
+PROMPT_BACKGROUND_TOKEN = "48;2;75;75;75m"
+PROMPT_BACKGROUND_SGR = "\x1b[48;2;75;75;75m"
+TRAILING_STYLED_SPACES_PATTERN = re.compile(
+    r"(?:\x1b\[[0-9;]*m[ \t]+\x1b\[0m)+(?=\n)"
+)
 WRITING_DIRECTIVE_PATTERN = re.compile(
     r'(?m)^[\ue200]?\s*:::writing\{(?P<attributes>[^}\n]*)\}\s*$'
 )
@@ -687,7 +692,20 @@ class ChatTui:
         lines = rendered.splitlines(keepends=True)
         split = max(0, len(lines) - transcript_rows)
         self.history_tail = "".join(lines[split:])
-        return "".join(lines[:split])
+        return self.stabilize_prompt_backgrounds("".join(lines[:split]))
+
+    @staticmethod
+    def stabilize_prompt_backgrounds(rendered: str) -> str:
+        """Fill prompt rows without relying on discardable trailing spaces."""
+        lines = []
+        for line in rendered.splitlines(keepends=True):
+            if PROMPT_BACKGROUND_TOKEN in line:
+                line = TRAILING_STYLED_SPACES_PATTERN.sub(
+                    PROMPT_BACKGROUND_SGR + "\x1b[K\x1b[0m",
+                    line,
+                )
+            lines.append(line)
+        return "".join(lines)
 
     def commit_initial_history(self) -> None:
         with self.lock:
