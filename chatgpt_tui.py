@@ -705,8 +705,12 @@ class ChatTui:
         self.committed_message_count = len(messages)
 
         def schedule_write() -> None:
+            def replay() -> None:
+                self.reset_terminal_session()
+                self.write_terminal_history(committed)
+
             future = run_in_terminal(
-                lambda: self.write_terminal_history(committed),
+                replay,
                 render_cli_done=False,
             )
 
