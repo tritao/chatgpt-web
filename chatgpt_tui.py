@@ -349,7 +349,14 @@ class ChatTui:
         self.resume_items: list[dict[str, Any]] = []
         self.resume_filtered: list[dict[str, Any]] = []
         self.resume_index = 0
-        self.resume_filter = Condition(lambda: self.resume_visible)
+        self.resume_filter = Condition(
+            lambda: self.resume_visible
+            and self.viewport_height().preferred >= 9
+            and self.terminal_columns() >= 24
+        )
+        self.full_footer_filter = Condition(
+            lambda: self.viewport_height().preferred >= 7
+        )
         self.follow_output = True
         self.transcript_line_count = 1
         self.active_started: float | None = None
@@ -371,6 +378,7 @@ class ChatTui:
         )
         self.transcript_window = TranscriptWindow(
             content=self.transcript_control,
+            height=D(min=0, preferred=1),
             wrap_lines=True,
             right_margins=[],
             allow_scroll_beyond_bottom=False,
@@ -406,18 +414,30 @@ class ChatTui:
         base = HSplit(
             [
                 self.transcript_window,
-                Window(
-                    height=1,
-                    content=FormattedTextControl(self.render_activity),
-                    style="class:activity",
+                ConditionalContainer(
+                    content=Window(
+                        height=1,
+                        content=FormattedTextControl(self.render_activity),
+                        style="class:activity",
+                    ),
+                    filter=self.full_footer_filter,
                 ),
-                Window(height=1, char=" ", style="class:composer"),
+                ConditionalContainer(
+                    content=Window(height=1, char=" ", style="class:composer"),
+                    filter=self.full_footer_filter,
+                ),
                 self.input,
-                Window(height=1, char=" ", style="class:composer"),
-                Window(
-                    height=1,
-                    content=FormattedTextControl(self.render_metadata),
-                    style="class:metadata",
+                ConditionalContainer(
+                    content=Window(height=1, char=" ", style="class:composer"),
+                    filter=self.full_footer_filter,
+                ),
+                ConditionalContainer(
+                    content=Window(
+                        height=1,
+                        content=FormattedTextControl(self.render_metadata),
+                        style="class:metadata",
+                    ),
+                    filter=self.full_footer_filter,
                 ),
             ],
             height=self.viewport_height,
@@ -507,12 +527,18 @@ class ChatTui:
     def render_prompt(self) -> FormattedText:
         return FormattedText([("class:prompt", " › ")])
 
+    def terminal_columns(self) -> int:
+        try:
+            return self.app.output.get_size().columns
+        except Exception:
+            return shutil.get_terminal_size((100, 24)).columns
+
     def viewport_height(self) -> D:
         try:
             rows = self.app.output.get_size().rows
         except Exception:
             rows = shutil.get_terminal_size((100, 24)).lines
-        return D.exact(max(6, rows))
+        return D.exact(max(1, rows))
 
     @staticmethod
     def format_elapsed(seconds: float) -> str:
@@ -619,6 +645,9 @@ class ChatTui:
         except Exception:
             fallback = shutil.get_terminal_size((100, 24))
             current = (fallback.columns, fallback.lines)
+        if self.resume_visible and (current[1] < 9 or current[0] < 24):
+            self.close_resume()
+            self.status = "Enlarge the terminal to browse conversations"
         if self.last_terminal_size is None:
             self.last_terminal_size = current
             return
@@ -1235,6 +1264,11 @@ class ChatTui:
 
     def open_resume(self) -> None:
         if self.busy or self.loading_conversation or self.resume_visible:
+            return
+        if self.viewport_height().preferred < 9 or self.terminal_columns() < 24:
+            self.status = "Enlarge the terminal to browse conversations"
+            self.app.layout.focus(self.input)
+            self.app.invalidate()
             return
         self.resume_visible = True
         self.resume_loading = True
