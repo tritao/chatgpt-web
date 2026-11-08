@@ -32,6 +32,8 @@ from urllib.parse import urljoin, urlsplit
 
 import httpx
 
+from retry_after import rate_limit_message
+
 
 DEFAULT_CDP_URL = "http://127.0.0.1:9222"
 DEFAULT_PAGE_SIZE = 28
@@ -326,9 +328,8 @@ class ChatGPTWebClient:
                 self.list_url, self.headers = capture_auth(self.cdp_url)
                 save_auth_snapshot(self.list_url, self.headers)
         if response.status_code == 429:
-            retry_after = response.headers.get("retry-after")
-            suffix = f"; retry after {retry_after} seconds" if retry_after else ""
-            raise ChatGPTWebError(f"ChatGPT web rate limit reached{suffix}")
+            raise ChatGPTWebError(
+                rate_limit_message(response.headers.get("retry-after")))
         if response.status_code >= 400:
             raise ChatGPTWebError(
                 f"ChatGPT returned HTTP {response.status_code} for {method} {response.url.path}"
@@ -541,9 +542,8 @@ class ChatGPTWebClient:
             timeout=httpx.Timeout(300.0),
         ) as response:
             if response.status_code == 429:
-                retry_after = response.headers.get("retry-after")
-                suffix = f"; retry after {retry_after} seconds" if retry_after else ""
-                raise ChatGPTWebError(f"ChatGPT web rate limit reached{suffix}")
+                raise ChatGPTWebError(
+                    rate_limit_message(response.headers.get("retry-after")))
             if response.status_code >= 400:
                 raise ChatGPTWebError(
                     f"ChatGPT submission returned HTTP {response.status_code}"
