@@ -32,6 +32,10 @@ home beside modern coding agents.
 - 📋 **Clipboard support** through `/copy`
 - 🪶 **Zero manual environment setup** when launched with `uv`
 
+On HTTP 429, the CLI displays a validated Retry-After period when the server
+provides one (including HTTP-date values). It does not silently resubmit a prompt
+or display untrusted response-header content as a countdown.
+
 ## 🚦 Quick start
 
 ### Requirements
