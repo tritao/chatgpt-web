@@ -4,9 +4,11 @@
 // transmission, and pass the request recipe to a local caller over stdout.
 
 const http = require("http");
+const { ComposerError, cdpPage, submitPrompt } = require("./chrome-composer.js");
 
 const cdpBase = process.env.CHATGPT_WEB_CDP_URL || "http://127.0.0.1:9222";
 const timeoutMs = Number(process.env.CHATGPT_WEB_RECIPE_TIMEOUT_MS || "30000");
+const callTimeoutMs = Number(process.env.CHATGPT_WEB_CDP_CALL_TIMEOUT_MS || "10000");
 
 function fail(message) {
   process.stderr.write(`chatgpt-web recipe: ${message}\n`);
@@ -55,11 +57,18 @@ async function main() {
   const sentinelResponses = [];
   let sequence = 0;
   let finished = false;
+  let clicked = false;
+  const startedAt = Date.now();
 
   function call(method, params = {}) {
     return new Promise((resolve, reject) => {
       const id = ++sequence;
-      pending.set(id, { resolve, reject });
+      const timer = setTimeout(() => {
+        pending.delete(id);
+        reject(new Error(`${method} timed out`));
+      }, callTimeoutMs);
+      const settle = (fn) => (value) => { clearTimeout(timer); fn(value); };
+      pending.set(id, { resolve: settle(resolve), reject: settle(reject) });
       socket.send(JSON.stringify({ id, method, params }));
     });
   }
@@ -67,7 +76,9 @@ async function main() {
   const timer = setTimeout(() => {
     if (!finished) {
       socket.close();
-      fail("timed out waiting for the send request");
+      fail(clicked
+        ? "send click did not produce a request in time; not retried"
+        : "timed out waiting for the ChatGPT composer; nothing was sent");
     }
   }, timeoutMs);
 
@@ -157,25 +168,16 @@ async function main() {
       // The intercepted request is deliberately aborted in the page. Always
       // navigate so a prior optimistic send cannot leave the composer disabled.
       await call("Page.navigate", { url: target });
-      const ready = await call("Runtime.evaluate", {
-        expression: `(async()=>{for(let i=0;i<300;i++){const e=document.querySelector("#prompt-textarea");if(e)return true;await new Promise(r=>setTimeout(r,100));}return false})()`,
-        awaitPromise: true,
-        returnByValue: true,
+      // Leave headroom so a pre-click failure keeps its specific message, and
+      // mark the click before it can be in flight.
+      await submitPrompt(cdpPage(call), input.prompt, {
+        deadline: startedAt + Math.max(0, timeoutMs - callTimeoutMs - 1000),
+        onBeforeClick: () => { clicked = true; },
       });
-      if (!ready.result.value) fail("ChatGPT composer did not become ready");
-      await call("Runtime.evaluate", {
-        expression: `(()=>{const e=document.querySelector("#prompt-textarea");e.focus();e.replaceChildren();e.dispatchEvent(new InputEvent("input",{bubbles:true,inputType:"deleteContentBackward"}));return true})()`,
-        returnByValue: true,
-      });
-      await call("Input.insertText", { text: input.prompt });
-      const submitted = await call("Runtime.evaluate", {
-        expression: `(async()=>{for(let i=0;i<100;i++){const b=document.querySelector("button[data-testid=send-button]");if(b&&!b.disabled){b.click();return true;}await new Promise(r=>setTimeout(r,100));}return false})()`,
-        awaitPromise: true,
-        returnByValue: true,
-      });
-      if (!submitted.result.value) fail("ChatGPT send button was unavailable");
     } catch (error) {
-      fail(error.message);
+      // After an ambiguous click, wait for the paused request; never retry.
+      if (finished || error.clicked) return;
+      fail(error instanceof ComposerError ? error.message : "ChatGPT debugger command failed");
     }
   });
   socket.addEventListener("error", () => fail("lost the Chrome debugger connection"));
