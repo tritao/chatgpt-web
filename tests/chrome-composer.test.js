@@ -7,7 +7,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
-const { cdpPage, pageComposer, submitPrompt } = require("../chrome-composer.js");
+const { cdpPage, normalize, pageComposer, submitPrompt } = require("../chrome-composer.js");
 
 const recipe = fs.readFileSync(path.join(__dirname, "..", "chrome-recipe.js"), "utf8");
 const PROMPT = "first line\n\n  indented secret";
@@ -30,7 +30,13 @@ function fakePage({ text = "", sendReady = true, typing = true } = {}) {
       if (typing && s.editor?.focused) s.editor.text += value;
       s.hooks.insert?.();
     },
-    async clickSend() { s.actions.push("click"); return { ...snap(), clicked: s.sendReady }; },
+    // Mirrors the page: compare and click happen atomically, after hooks.click.
+    async clickSend(expected, id) {
+      s.hooks.click?.();
+      const ok = !!s.editor && s.editor.id === id && normalize(s.editor.text) === expected && s.sendReady;
+      if (ok) s.actions.push("click");
+      return { ...snap(), clicked: ok, refused: !ok };
+    },
   };
   return { page, s, now: () => clock, sleep: async (ms) => { clock += ms; } };
 }
@@ -116,6 +122,18 @@ test("an ambiguous click is flagged first and never retried", async () => {
   assert.deepEqual(events, ["before", "click"]);
 });
 
+test("a change after the last host inspection is refused at click time", async () => {
+  for (const mutate of [(f) => { f.s.editor.text += " (user edit)"; }, (f) => f.s.replace(PROMPT)]) {
+    const f = fakePage();
+    let signalled = false;
+    f.s.hooks.click = () => mutate(f);
+    await assert.rejects(run(f, { onBeforeClick: () => { signalled = true; } }),
+      (error) => error.clicked === false && /changed at the moment of sending; nothing was sent/.test(error.message));
+    assert.ok(!f.s.actions.includes("click"));
+    assert.equal(signalled, true); // conservative: flagged before the attempt
+  }
+});
+
 test("transient lifecycle errors are retried; other errors propagate", async () => {
   const f = fakePage();
   const inspect = f.page.inspect;
@@ -140,14 +158,26 @@ test("in-page snapshot reads ProseMirror lines, skips hidden editors, acts only 
   const button = { isConnected: true, disabled: false, click() { clicks++; } };
   Object.assign(document, { querySelectorAll: () => [node([], []), editor], querySelector: () => button });
   const ctx = vm.createContext({ document, window: {} });
-  const evalIn = (action) => vm.runInContext(`(${pageComposer})(${JSON.stringify(action)})`, ctx);
+  const evalIn = (action, expected = "", id = 0) => vm.runInContext(
+    `(${pageComposer})(${[action, expected, id].map((v) => JSON.stringify(v))},${normalize})`, ctx);
   const first = evalIn("inspect");
   assert.equal(first.text, PROMPT);
   assert.equal(first.focused, false);
   assert.equal(clicks, 0);
   assert.equal(evalIn("inspect").id, first.id);
   assert.equal(evalIn("focus").focused, true);
-  assert.equal(evalIn("click").clicked, true);
+  assert.equal(evalIn("click", "first line", first.id).refused, true);
+  assert.equal(evalIn("click", PROMPT, first.id + 1).refused, true);
+  assert.equal(clicks, 0);
+  assert.equal(evalIn("click", PROMPT, first.id).clicked, true);
+  assert.equal(clicks, 1);
+  // Text mutated after the host's inspection: the same evaluation refuses.
+  editor.childNodes[2] = p(text("  edited secret"));
+  const refused = evalIn("click", PROMPT, first.id);
+  assert.deepEqual([refused.clicked, refused.refused, clicks], [false, true, 1]);
+  button.disabled = true;
+  editor.childNodes[2] = p(text("  indented secret"));
+  assert.equal(evalIn("click", PROMPT, first.id).refused, true);
   assert.equal(clicks, 1);
 });
 

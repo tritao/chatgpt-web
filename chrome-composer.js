@@ -13,12 +13,14 @@ class ComposerError extends Error {
   }
 }
 
-// Evaluated in the page; must stay self-contained.
-function pageComposer(action) {
+// Evaluated in the page; must stay self-contained. For "click", the editor
+// identity and text are re-checked in the same evaluation as the click, so a
+// change after the host's last inspection can never be sent.
+function pageComposer(action, expected, expectedId, normalizeText) {
   const editor = [...document.querySelectorAll("#prompt-textarea")].find((node) =>
     node.isConnected && node.getClientRects().length > 0 &&
     (node.isContentEditable || node.tagName === "TEXTAREA"));
-  if (!editor) return { present: false };
+  if (!editor) return { present: false, refused: action === "click" };
   if (!editor.__chatgptWebId) {
     window.__chatgptWebSeq = (window.__chatgptWebSeq || 0) + 1;
     editor.__chatgptWebId = window.__chatgptWebSeq;
@@ -33,19 +35,23 @@ function pageComposer(action) {
   if (action === "focus") editor.focus();
   const button = document.querySelector('button[data-testid="send-button"]');
   const sendReady = !!button && button.isConnected && !button.disabled;
-  if (action === "click" && sendReady) button.click();
+  const matches = action === "click" && editor.__chatgptWebId === expectedId &&
+    normalizeText(text) === expected;
+  if (matches && sendReady) button.click();
   const active = document.activeElement;
   return {
     present: true, id: editor.__chatgptWebId, text: text || "", sendReady,
     focused: active === editor || (!!active && editor.contains(active)),
-    clicked: action === "click" && sendReady,
+    clicked: matches && sendReady,
+    refused: action === "click" && !(matches && sendReady),
   };
 }
 
 function cdpPage(call) {
-  const run = async (action) => {
+  const run = async (action, expected = "", id = 0) => {
+    const args = [action, expected, id].map((value) => JSON.stringify(value)).join(",");
     const response = await call("Runtime.evaluate", {
-      expression: `(${pageComposer})(${JSON.stringify(action)})`, returnByValue: true,
+      expression: `(${pageComposer})(${args},${normalize})`, returnByValue: true,
     });
     if (response.exceptionDetails) throw new Error("Execution context was destroyed");
     return response.result?.value || { present: false };
@@ -53,7 +59,7 @@ function cdpPage(call) {
   return {
     inspect: () => run("inspect"),
     focus: () => run("focus"),
-    clickSend: () => run("click"),
+    clickSend: (expected, id) => run("click", expected, id),
     insertText: (text) => call("Input.insertText", { text }),
   };
 }
@@ -142,12 +148,16 @@ async function submitPrompt(page, prompt, options = {}) {
       o.onBeforeClick?.();
       let result;
       try {
-        result = await page.clickSend();
+        result = await page.clickSend(expected, snap.id);
       } catch (_error) {
         throw new ComposerError("ChatGPT send outcome is ambiguous; not retried", true);
       }
-      if (!result?.clicked) throw new ComposerError("ChatGPT send outcome is ambiguous; not retried", true);
-      return;
+      if (result?.clicked) return;
+      // The page refused in the same evaluation, so no click happened.
+      if (result?.refused) {
+        throw new ComposerError("ChatGPT composer changed at the moment of sending; nothing was sent");
+      }
+      throw new ComposerError("ChatGPT send outcome is ambiguous; not retried", true);
     }
     if (now() >= end) throw new ComposerError("ChatGPT send button was unavailable; nothing was sent");
     await pause(end);
