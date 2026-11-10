@@ -276,3 +276,9 @@ This project is suitable for experimentation on your own account. Expect
 occasional breakage, rate limits, forced reauthentication, and protocol changes.
 For supported integrations and production applications, use the official OpenAI
 API instead.
+
+## License
+
+Licensed under the [MIT License](LICENSE). You may use, modify, and redistribute
+this project, including in standalone packages, under those terms. Preserve the
+copyright and permission notices when distributing copies or substantial portions.
