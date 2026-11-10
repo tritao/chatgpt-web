@@ -4,6 +4,7 @@
 // leaves challenge-token generation to the web application.
 
 const http = require("http");
+const { cdpPage, submitPrompt } = require("./chrome-composer.js");
 
 const cdpBase = process.env.CHATGPT_WEB_CDP_URL || "http://127.0.0.1:9222";
 const timeoutMs = Number(process.env.CHATGPT_WEB_SEND_TIMEOUT_MS || "300000");
@@ -49,7 +50,7 @@ async function main() {
   }
   const pages = await getJson(`${cdpBase}/json/list`);
   const page = pages.find((item) =>
-    item.type === "page" && item.url.startsWith("https://chatgpt.com"));
+    item.type === "page" && new URL(item.url).origin === "https://chatgpt.com");
   if (!page) fail("no ChatGPT tab found in the debugging browser");
 
   const socket = new WebSocket(page.webSocketDebuggerUrl);
@@ -69,7 +70,12 @@ async function main() {
   function call(method, params = {}) {
     return new Promise((resolve, reject) => {
       const id = ++sequence;
-      pending.set(id, { resolve, reject });
+      const timeout = setTimeout(() => {
+        pending.delete(id);
+        reject(new Error(`${method} timed out; send outcome may be ambiguous; not retried`));
+      }, 10000);
+      const settle = (fn) => (value) => { clearTimeout(timeout); fn(value); };
+      pending.set(id, { resolve: settle(resolve), reject: settle(reject) });
       socket.send(JSON.stringify({ id, method, params }));
     });
   }
@@ -79,6 +85,8 @@ async function main() {
     finished = true;
     clearTimeout(timer);
     await new Promise((resolve) => setTimeout(resolve, 250));
+    // Flush the final DOM text before reporting completion.
+    await pollAssistant(true);
     const location = await call("Runtime.evaluate", {
       expression: "location.href",
       returnByValue: true,
@@ -93,8 +101,8 @@ async function main() {
     socket.close();
   }
 
-  async function pollAssistant() {
-    if (polling || finished || socket.readyState !== WebSocket.OPEN) return;
+  async function pollAssistant(force = false) {
+    if (polling || (finished && !force) || socket.readyState !== WebSocket.OPEN) return;
     polling = true;
     try {
       const result = await call("Runtime.evaluate", {
@@ -121,7 +129,7 @@ async function main() {
   const timer = setTimeout(() => {
     if (!finished) {
       socket.close();
-      fail("timed out waiting for ChatGPT to finish responding");
+      fail("timed out waiting for ChatGPT; send outcome may be ambiguous; not retried");
     }
   }, timeoutMs);
 
@@ -173,31 +181,29 @@ async function main() {
         returnByValue: true,
       });
       if (current.result.value !== target) {
-        await call("Page.navigate", { url: target });
+        const navigation = await call("Page.navigate", { url: target });
+        if (navigation.errorText) fail("could not open the requested conversation; nothing was sent");
+        const deadline = Date.now() + 30000;
+        let arrived = false;
+        while (Date.now() < deadline) {
+          try {
+            const location = await call("Runtime.evaluate", {
+              expression: "location.href", returnByValue: true,
+            });
+            if (location.result?.value === target) { arrived = true; break; }
+          } catch (_error) { /* Navigation replaces the execution context. */ }
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+        if (!arrived) fail("requested conversation did not open; nothing was sent");
       }
-      const ready = await call("Runtime.evaluate", {
-        expression: `(async()=>{for(let i=0;i<300;i++){const e=document.querySelector("#prompt-textarea");if(e)return true;await new Promise(r=>setTimeout(r,100));}return false})()`,
-        awaitPromise: true,
-        returnByValue: true,
-      });
-      if (!ready.result.value) fail("ChatGPT composer did not become ready");
       const baseline = await call("Runtime.evaluate", {
         expression: `document.querySelectorAll("[data-message-author-role=assistant]").length`,
         returnByValue: true,
       });
       baselineAssistantCount = baseline.result.value || 0;
-      const focused = await call("Runtime.evaluate", {
-        expression: `(()=>{const e=document.querySelector("#prompt-textarea");if(!e)return false;e.focus();e.replaceChildren();e.dispatchEvent(new InputEvent("input",{bubbles:true,inputType:"deleteContentBackward"}));return true})()`,
-        returnByValue: true,
+      await submitPrompt(cdpPage(call), input.prompt, {
+        deadline: Date.now() + Math.min(timeoutMs, 45000),
       });
-      if (!focused.result.value) fail("could not focus the ChatGPT composer");
-      await call("Input.insertText", { text: input.prompt });
-      const submitted = await call("Runtime.evaluate", {
-        expression: `(async()=>{for(let i=0;i<100;i++){const b=document.querySelector("button[data-testid=send-button]");if(b&&!b.disabled){b.click();return true;}await new Promise(r=>setTimeout(r,100));}return false})()`,
-        awaitPromise: true,
-        returnByValue: true,
-      });
-      if (!submitted.result.value) fail("ChatGPT send button was unavailable");
       const pollTimer = setInterval(pollAssistant, 100);
       const heartbeat = setInterval(() => {
         if (!finished) emit({ type: "heartbeat" });
@@ -210,7 +216,10 @@ async function main() {
       fail(error.message);
     }
   });
-  socket.addEventListener("error", () => fail("lost the Chrome debugger connection"));
+  socket.addEventListener("error", () => fail("lost the Chrome debugger connection; send outcome may be ambiguous; not retried"));
+  socket.addEventListener("close", () => {
+    if (!finished) fail("Chrome debugger disconnected; send outcome may be ambiguous; not retried");
+  });
 
   process.on("SIGTERM", async () => {
     try {

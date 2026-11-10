@@ -33,6 +33,7 @@ from urllib.parse import urljoin, urlsplit
 import httpx
 
 from retry_after import rate_limit_message
+from sentinel import ChatGPTWebError, SentinelCompatibilityError, SentinelSigner
 
 
 DEFAULT_CDP_URL = "http://127.0.0.1:9222"
@@ -45,12 +46,12 @@ FORBIDDEN_REPLAY_HEADERS = {
 }
 
 
-class ChatGPTWebError(RuntimeError):
-    pass
-
-
-class SentinelCompatibilityError(ChatGPTWebError):
-    pass
+def send_mode() -> str:
+    value = os.environ.get("CHATGPT_WEB_SEND_MODE", "browser")
+    value = {"node": "direct", "chrome": "browser"}.get(value, value)
+    if value not in {"browser", "direct", "auto", "recipe"}:
+        raise ChatGPTWebError("CHATGPT_WEB_SEND_MODE must be browser, direct, auto, or recipe")
+    return value
 
 
 def default_socket_path() -> Path:
@@ -402,8 +403,9 @@ class ChatGPTWebClient:
         attachments: list[dict[str, Any]] | None = None,
         on_event: Any = None,
     ) -> tuple[str, dict[str, Any], set[str]]:
-        if attachments and os.environ.get("CHATGPT_WEB_SEND_MODE", "node") != "node":
-            raise ChatGPTWebError("image attachments require the direct node send mode")
+        mode = send_mode()
+        if attachments and mode not in {"direct", "auto"}:
+            raise ChatGPTWebError("image attachments require CHATGPT_WEB_SEND_MODE=direct")
         previous_ids: set[str] = set()
         previous: dict[str, Any] | None = None
         if conversation_id:
@@ -415,22 +417,42 @@ class ChatGPTWebClient:
                     if isinstance(item, dict) and item.get("id")
                 }
 
-        if os.environ.get("CHATGPT_WEB_SEND_MODE", "node") != "chrome":
-            resolved_id, submitted_message_id = self.send_prompt_direct(
-                previous, prompt, attachments or [], on_event
-            )
-            conversation = self.get_conversation(resolved_id)
-            messages = conversation.get("messages", [])
-            attached = isinstance(messages, list) and any(
-                isinstance(message, dict) and message.get("id") == submitted_message_id
-                for message in messages
-            )
-            if not attached:
-                raise ChatGPTWebError(
-                    "ChatGPT did not attach the submitted message to the conversation"
-                )
-            return resolved_id, conversation, previous_ids
+        if mode == "browser":
+            return self.send_prompt_browser(conversation_id, prompt, previous_ids, on_event)
 
+        # Only signing failures occur before submission. Never catch HTTP, stream,
+        # callback, or history errors here: the message may already have arrived.
+        sentinel_headers = None
+        if mode != "recipe":
+            try:
+                sentinel_headers = self.create_sentinel_headers()
+            except SentinelCompatibilityError:
+                if mode != "auto" or attachments:
+                    raise
+                return self.send_prompt_browser(conversation_id, prompt, previous_ids, on_event)
+        resolved_id, submitted_message_id = self.send_prompt_direct(
+            previous, prompt, attachments or [], on_event,
+            sentinel_headers=sentinel_headers, recipe=mode == "recipe",
+        )
+        conversation = self.get_conversation(resolved_id)
+        messages = conversation.get("messages", [])
+        attached = isinstance(messages, list) and any(
+            isinstance(message, dict) and message.get("id") == submitted_message_id
+            for message in messages
+        )
+        if not attached:
+            raise ChatGPTWebError(
+                "ChatGPT did not attach the submitted message to the conversation"
+            )
+        return resolved_id, conversation, previous_ids
+
+    def send_prompt_browser(
+        self, conversation_id: str | None, prompt: str,
+        previous_ids: set[str], on_event: Any = None,
+    ) -> tuple[str, dict[str, Any], set[str]]:
+        if not chrome_is_ready(self.cdp_url):
+            launch_login_browser(self.cdp_url)
+        # Browser errors never trigger another transport or another submission.
         helper = Path(__file__).with_name("chrome-send.js")
         environment = os.environ.copy()
         environment["CHATGPT_WEB_CDP_URL"] = self.cdp_url.rstrip("/")
@@ -465,18 +487,22 @@ class ChatGPTWebClient:
                 elif on_event is not None:
                     on_event(event)
             return_code = process.wait(timeout=5)
-        except (BrokenPipeError, ConnectionError, OSError):
+        except subprocess.TimeoutExpired as error:
+            if process is not None:
+                process.kill()
+                process.wait()
+            raise ChatGPTWebError("prompt submission timed out; outcome may be ambiguous; not retried") from error
+        except BaseException:
+            # Includes malformed events, callback failures, and cancellation:
+            # terminate the helper without making another send attempt.
             if process is not None and process.poll() is None:
                 process.terminate()
                 try:
                     process.wait(timeout=2)
                 except subprocess.TimeoutExpired:
                     process.kill()
+                    process.wait()
             raise
-        except subprocess.TimeoutExpired as error:
-            if process is not None:
-                process.kill()
-            raise ChatGPTWebError("prompt submission timed out") from error
         if return_code != 0:
             assert process.stderr is not None
             detail = process.stderr.read().strip() or "prompt submission failed"
@@ -493,36 +519,24 @@ class ChatGPTWebClient:
         prompt: str,
         attachments: list[dict[str, Any]],
         on_event: Any = None,
+        *, sentinel_headers: dict[str, str] | None = None,
+        recipe: bool = False,
     ) -> tuple[str, str]:
         conversation_id = None
         if conversation:
             candidate = conversation.get("conversation_id") or conversation.get("id")
             if isinstance(candidate, str):
                 conversation_id = candidate
-        mode = os.environ.get("CHATGPT_WEB_SEND_MODE", "node")
-        if mode == "recipe":
-            method, url, headers, body = self.capture_send_recipe(
-                conversation_id, prompt
-            )
+        if recipe:
+            method, url, headers, body = self.capture_send_recipe(conversation_id, prompt)
         else:
-            try:
+            if sentinel_headers is None:
                 sentinel_headers = self.create_sentinel_headers()
-            except SentinelCompatibilityError as error:
-                if not chrome_is_ready(self.cdp_url):
-                    raise ChatGPTWebError(
-                        f"{error}; run chatgpt-web login for compatibility fallback"
-                    ) from error
-                method, url, headers, body = self.capture_send_recipe(
-                    conversation_id, prompt
-                )
-            else:
-                method = "POST"
-                url = urljoin(CHATGPT_ORIGIN, "/backend-api/f/conversation")
-                headers = self.headers.copy()
-                headers.update(sentinel_headers)
-                body = self.create_conversation_body(
-                    conversation, prompt, attachments
-                )
+            method = "POST"
+            url = urljoin(CHATGPT_ORIGIN, "/backend-api/f/conversation")
+            headers = self.headers.copy()
+            headers.update(sentinel_headers)
+            body = self.create_conversation_body(conversation, prompt, attachments)
 
         headers.pop("x-openai-web-sse-compression", None)
         headers["x-openai-target-path"] = "/backend-api/f/conversation"
@@ -587,73 +601,8 @@ class ChatGPTWebClient:
             raise ChatGPTWebError("ChatGPT did not return a conversation ID")
         return resolved_id, submitted_message_id
 
-    def run_sentinel_node(
-        self, arguments: list[str], payload: dict[str, Any] | None = None
-    ) -> dict[str, Any]:
-        helper = Path(__file__).with_name("sentinel-node-probe.js")
-        environment = os.environ.copy()
-        try:
-            result = subprocess.run(
-                ["node", str(helper), *arguments],
-                input=json.dumps(payload) if payload is not None else None,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=30,
-                check=False,
-                env=environment,
-            )
-        except FileNotFoundError as error:
-            raise SentinelCompatibilityError(
-                "Node.js 22 or newer is required for signing"
-            ) from error
-        except subprocess.TimeoutExpired as error:
-            raise SentinelCompatibilityError("Sentinel signing timed out") from error
-        if result.returncode != 0:
-            detail = result.stderr.strip() or "Sentinel signing failed"
-            raise SentinelCompatibilityError(detail)
-        try:
-            value = json.loads(result.stdout)
-        except json.JSONDecodeError as error:
-            raise SentinelCompatibilityError(
-                "Sentinel signer returned invalid JSON"
-            ) from error
-        if not isinstance(value, dict):
-            raise SentinelCompatibilityError(
-                "Sentinel signer returned an invalid result"
-            )
-        return value
-
     def create_sentinel_headers(self) -> dict[str, str]:
-        initial = self.run_sentinel_node(["--emit-initial"]).get("initial")
-        if not isinstance(initial, str) or not initial:
-            raise SentinelCompatibilityError(
-                "Sentinel signer did not generate an initial proof"
-            )
-        requirements = self.request(
-            "POST",
-            urljoin(CHATGPT_ORIGIN, "/backend-api/sentinel/chat-requirements/prepare"),
-            json={"p": initial},
-        ).json()
-        if not isinstance(requirements, dict):
-            raise ChatGPTWebError("Sentinel prepare returned an invalid response")
-        enforcement = self.run_sentinel_node(
-            ["--requirements-stdin", "--emit-enforcement-json"], requirements
-        )
-        prepare_token = requirements.get("prepare_token")
-        proof = enforcement.get("proof")
-        turnstile = enforcement.get("turnstile")
-        if not isinstance(prepare_token, str) or not isinstance(proof, str):
-            raise SentinelCompatibilityError(
-                "Sentinel did not return required enforcement tokens"
-            )
-        result = {
-            "openai-sentinel-chat-requirements-prepare-token": prepare_token,
-            "openai-sentinel-proof-token": proof,
-        }
-        if isinstance(turnstile, str) and turnstile:
-            result["openai-sentinel-turnstile-token"] = turnstile
-        return result
+        return SentinelSigner(self.request).create_sentinel_headers()
 
     def create_conversation_body(
         self,
@@ -1444,7 +1393,7 @@ def handle_daemon_command(
             "daemon": "running",
             "session_saved": auth_store_path().is_file(),
             "chrome": "running" if chrome_is_ready(client.cdp_url) else "stopped",
-            "send_mode": os.environ.get("CHATGPT_WEB_SEND_MODE", "node"),
+            "send_mode": send_mode(),
             "sentinel_cache": sentinel_cache_status(),
         }, False
     if command == "list":
