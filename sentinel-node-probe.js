@@ -46,16 +46,17 @@ async function loadSdk() {
   let cached = null;
   try { cached = readCachedSdk(); }
   catch (_error) { cached = null; }
-  if (cached && Date.now() - cached.checked_at < cacheTtlMs) {
+  const refresh = process.argv.includes("--refresh");
+  if (!refresh && cached && Date.now() - cached.checked_at < cacheTtlMs) {
     return { ...cached, cacheStatus: "hit" };
   }
   try {
-    const bootstrapResponse = await fetch(bootstrapUrl);
+    const bootstrapResponse = await fetch(bootstrapUrl, { signal: AbortSignal.timeout(10000) });
     if (!bootstrapResponse.ok) throw new Error(`bootstrap HTTP ${bootstrapResponse.status}`);
     const bootstrap = await bootstrapResponse.text();
-    const implementation = bootstrap.match(/script\.src = '([^']+)'/)?.[1];
+    const implementation = bootstrap.match(/script\.src\s*=\s*["']([^"']+)["']/)?.[1];
     if (!implementation) throw new Error("Sentinel implementation URL not found");
-    const sourceResponse = await fetch(implementation);
+    const sourceResponse = await fetch(implementation, { signal: AbortSignal.timeout(10000) });
     if (!sourceResponse.ok) throw new Error(`SDK HTTP ${sourceResponse.status}`);
     const source = await sourceResponse.text();
     const digest = sha256(source);
@@ -70,7 +71,7 @@ async function loadSdk() {
     writeAtomic(path.join(directory, "current.json"), `${JSON.stringify(manifest)}\n`);
     return { ...manifest, source, cacheStatus: cached ? "updated" : "miss" };
   } catch (error) {
-    if (cached) return { ...cached, cacheStatus: "stale-offline" };
+    if (cached && !refresh) return { ...cached, cacheStatus: "stale-offline" };
     throw error;
   }
 }
@@ -94,19 +95,9 @@ async function main() {
   const loadedSdk = await loadSdk();
   const implementation = loadedSdk.implementation;
   let source = loadedSdk.source;
-  const proofExport = /var P=new _;/;
-  if (!proofExport.test(source)) {
-    throw new Error("Sentinel proof engine signature changed");
-  }
-  source = source.replace(proofExport, "var P=new _;globalThis.__proofEngine=P;");
-  const turnstileExport = /function _n\(t,n\)\{/;
-  if (!turnstileExport.test(source)) {
-    throw new Error("Sentinel turnstile VM signature changed");
-  }
-  source = source.replace(
-    turnstileExport,
-    "globalThis.__turnstileVM=(t,n)=>_n(t,n);function _n(t,n){",
-  );
+  // Find candidates structurally, then validate their runtime interface. Minified
+  // binding names change between releases; the runtime methods identify the internal interface.
+  source = instrumentProofEngines(source);
 
   const requestedElements = [];
   const appendedElements = [];
@@ -207,8 +198,17 @@ async function main() {
   vm.createContext(sandbox);
   vm.runInContext(source, sandbox, { filename: "sentinel-sdk.js", timeout: 5000 });
 
+  const candidates = sandbox.__sentinelProofCandidates || [];
+  const engines = candidates.filter((value) => value &&
+    typeof value.getRequirementsToken === "function" &&
+    typeof value.getEnforcementToken === "function");
+  if (engines.length !== 1) {
+    throw new Error(`Sentinel proof engine interface changed (SDK ${loadedSdk.sha256}; matches ${engines.length})`);
+  }
+  const proofEngine = engines[0];
+
   if (process.argv.includes("--emit-initial")) {
-    const initial = await sandbox.__proofEngine.getRequirementsToken();
+    const initial = await proofEngine.getRequirementsToken();
     process.stdout.write(`${JSON.stringify({ initial })}\n`);
     return;
   }
@@ -220,12 +220,13 @@ async function main() {
       difficulty: "0fffff",
     },
   };
-  const proof = await sandbox.__proofEngine.getEnforcementToken(requirements);
+  if (requirements?.turnstile?.required) {
+    throw new Error("Sentinel requires a browser challenge; use browser send mode");
+  }
+  const proof = await proofEngine.getEnforcementToken(requirements);
   if (process.argv.includes("--emit-enforcement-json")) {
-    const initial = await sandbox.__proofEngine.getRequirementsToken();
-    const turnstile = requirements?.turnstile?.dx
-      ? await sandbox.__turnstileVM(requirements, requirements.turnstile.dx)
-      : null;
+    const initial = await proofEngine.getRequirementsToken();
+    const turnstile = null;
     process.stdout.write(`${JSON.stringify({ initial, proof, turnstile })}\n`);
     return;
   }
@@ -266,6 +267,8 @@ async function main() {
     requested_elements: [...new Set(requestedElements)],
     appended_elements: [...new Set(appendedElements)],
     message_bridge_installed: listeners.has("message"),
+    // This bridge uses synthetic requirements; it is not a server acceptance test.
+    full_token_uses_synthetic_requirements: !suppliedRequirements,
     full_token_generated: typeof tokenResult === "string",
     full_token_keys: tokenKeys,
     full_token_shape: tokenShape,
@@ -274,7 +277,15 @@ async function main() {
   process.stdout.write(`${JSON.stringify(result)}\n`);
 }
 
-main().catch((error) => {
+function instrumentProofEngines(source) {
+  const binding = /\b(var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*new\s+([A-Za-z_$][\w$]*)\s*(?:\(\s*\))?\s*;/g;
+  return source.replace(binding, (statement, _kind, name) =>
+    `${statement}(globalThis.__sentinelProofCandidates ||= []).push(${name});`);
+}
+
+module.exports = { instrumentProofEngines };
+
+if (require.main === module) main().catch((error) => {
   process.stderr.write(`sentinel-node-probe: ${error.message}\n`);
   process.exit(1);
 });
