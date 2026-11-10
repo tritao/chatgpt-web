@@ -255,7 +255,7 @@ class ChatGPTWebClient:
             follow_redirects=False,
             timeout=httpx.Timeout(30.0),
         )
-        self.refresh_auth(prefer_browser=True)
+        self.refresh_auth(prefer_browser=send_mode() in {"browser", "recipe"})
 
     def close(self) -> None:
         self.http.close()
@@ -539,6 +539,7 @@ class ChatGPTWebClient:
             body = self.create_conversation_body(conversation, prompt, attachments)
 
         headers.pop("x-openai-web-sse-compression", None)
+        headers["accept-encoding"] = "gzip, deflate"
         headers["x-openai-target-path"] = "/backend-api/f/conversation"
         headers["x-openai-target-route"] = "/backend-api/f/conversation"
         body["supported_encodings"] = []

@@ -89,9 +89,10 @@ function readStdinJson() {
 }
 
 async function main() {
-  const suppliedRequirements = process.argv.includes("--requirements-stdin")
-    ? await readStdinJson()
-    : null;
+  const supplied = process.argv.includes("--requirements-stdin")
+    ? await readStdinJson() : null;
+  const suppliedRequirements = supplied?.requirements || supplied;
+  const suppliedInitial = supplied?.initial;
   const loadedSdk = await loadSdk();
   const implementation = loadedSdk.implementation;
   let source = loadedSdk.source;
@@ -124,7 +125,7 @@ async function main() {
           requestId: message.requestId,
           result: {
             cachedChatReq: requirements,
-            cachedProof: message.p,
+            cachedProof: suppliedInitial || message.p,
           },
         },
       }), 0);
@@ -137,12 +138,21 @@ async function main() {
     scripts: [currentScript],
     location: { href: implementation, origin: "https://chatgpt.com" },
     documentElement: { getAttribute: () => null },
-    body: { appendChild: (element) => { appendedElements.push(element.tagName); } },
+    body: {
+      appendChild: (element) => { appendedElements.push(element.tagName); return element; },
+      removeChild: (element) => element,
+    },
     createElement: (tag) => {
       requestedElements.push(tag);
       return {
         tagName: tag.toUpperCase(),
+        // No graphics context is available in this non-rendering environment.
+        ...(tag.toLowerCase() === "canvas" ? { getContext: () => null } : {}),
         style: {},
+        // The Node probe has no renderer: its elements have no layout box.
+        getBoundingClientRect: () => ({ x: 0, y: 0, top: 0, right: 0,
+          bottom: 0, left: 0, width: 0, height: 0 }),
+        remove: noop,
         setAttribute: noop,
         addEventListener: (name, callback) => {
           if (name === "load") setTimeout(callback, 0);
@@ -156,7 +166,7 @@ async function main() {
     querySelector: () => null,
   };
   sandbox = {
-    console,
+    console: { log: noop, info: noop, warn: noop, error: noop, debug: noop },
     crypto: globalThis.crypto,
     TextEncoder,
     TextDecoder,
@@ -181,9 +191,16 @@ async function main() {
       platform: process.platform,
       hardwareConcurrency: 8,
       deviceMemory: 8,
+      plugins: [],
+      mimeTypes: [],
+      maxTouchPoints: 0,
+      vendor: "",
     },
     document,
-    location: { href: "https://chatgpt.com/", origin: "https://chatgpt.com" },
+    history: { length: 1, state: null },
+    localStorage: createMemoryStorage(),
+    sessionStorage: createMemoryStorage(),
+    location: { href: "https://chatgpt.com/", origin: "https://chatgpt.com", search: "", ancestorOrigins: [] },
     requestIdleCallback: (callback) => setTimeout(
       () => callback({ timeRemaining: () => 10, didTimeout: false }), 0),
     addEventListener: (name, callback) => listeners.set(name, callback),
@@ -220,16 +237,19 @@ async function main() {
       difficulty: "0fffff",
     },
   };
-  if (requirements?.turnstile?.required) {
-    throw new Error("Sentinel requires a browser challenge; use browser send mode");
-  }
-  const proof = await proofEngine.getEnforcementToken(requirements);
   if (process.argv.includes("--emit-enforcement-json")) {
-    const initial = await proofEngine.getRequirementsToken();
-    const turnstile = null;
-    process.stdout.write(`${JSON.stringify({ initial, proof, turnstile })}\n`);
+    if (requirements?.turnstile?.required &&
+        (typeof suppliedInitial !== "string" || !suppliedInitial)) {
+      throw new Error("Sentinel VM evidence requires the original preparation proof");
+    }
+    // Let the SDK bind the exact prepared response to its original proof and
+    // evaluate dx through its public API. Never extract a minified VM function.
+    const evidence = parseEvidence(
+      await sandbox.SentinelSDK.token("__default__"), requirements);
+    process.stdout.write(`${JSON.stringify(evidence)}\n`);
     return;
   }
+  const proof = await proofEngine.getEnforcementToken(requirements);
   let tokenResult;
   let tokenError;
   try {
@@ -283,7 +303,47 @@ function instrumentProofEngines(source) {
     `${statement}(globalThis.__sentinelProofCandidates ||= []).push(${name});`);
 }
 
-module.exports = { instrumentProofEngines };
+function createMemoryStorage() {
+  const values = new Map();
+  return {
+    get length() { return values.size; },
+    getItem: (key) => values.get(String(key)) ?? null,
+    setItem: (key, value) => { values.set(String(key), String(value)); },
+    removeItem: (key) => { values.delete(String(key)); },
+    clear: () => values.clear(),
+    key: (index) => [...values.keys()][index] ?? null,
+  };
+}
+
+function parseEvidence(token, requirements) {
+  let value;
+  try { value = JSON.parse(token); }
+  catch { throw new Error("Sentinel SDK returned invalid evidence JSON"); }
+  if (!value || typeof value !== "object" || value.e) {
+    throw new Error("Sentinel SDK could not generate evidence in Node");
+  }
+  const proof = typeof value.p === "string" && value.p ? value.p : null;
+  const turnstile = typeof value.t === "string" && value.t ? value.t : null;
+  if (requirements?.proofofwork?.required && !proof) {
+    throw new Error("Sentinel SDK returned no required proof of work");
+  }
+  if (requirements?.turnstile?.required && !turnstile) {
+    throw new Error("Sentinel SDK returned no required VM evidence");
+  }
+  if (turnstile && vmDiagnostic(turnstile)) {
+    throw new Error("Sentinel VM could not complete in Node; use browser send mode");
+  }
+  return { proof, turnstile };
+}
+
+function vmDiagnostic(value) {
+  if (/^\d+$/.test(value)) return true;
+  try {
+    return /^\d+: /.test(atob(value));
+  } catch { return false; }
+}
+
+module.exports = { instrumentProofEngines, parseEvidence, createMemoryStorage };
 
 if (require.main === module) main().catch((error) => {
   process.stderr.write(`sentinel-node-probe: ${error.message}\n`);

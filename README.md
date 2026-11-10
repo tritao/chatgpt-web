@@ -186,8 +186,11 @@ Image attachments currently require `direct` mode. In `auto` mode they can use
 the direct transport, but a signing failure stops instead of falling back and
 losing the attachment. Browser attachment submission is not implemented.
 
-Direct mode never starts Chrome as a fallback. A required browser challenge is
-reported as a compatibility error. No transport switch or automatic resubmission
+Direct mode never starts Chrome as a fallback. When preparation requires VM
+evidence (`turnstile.required` with `dx`), the SDK evaluates it in Node using the
+original preparation proof. The adapter finalizes that evidence and submits the
+returned requirements token. An unsupported environment or incomplete evidence
+is reported as a compatibility error. No transport switch or automatic resubmission
 occurs after a conversation request begins, including on timeouts, rate limits,
 or failures while reading the result. An uncertain outcome must be checked in
 conversation history before manually sending again.
@@ -226,18 +229,29 @@ bridge and does **not** establish server acceptance or successful sending.
 
 The signer discovers proof-engine candidates by constructor assignments and
 checks their runtime methods rather than assuming fixed minified binding names.
-This still relies on SDK internals. Required browser challenges stop direct mode;
-the helper no longer extracts the private challenge interpreter.
+This still relies on SDK internals for the initial proof. For VM evidence, the
+helper calls the SDK's public `token()` method through its local requirements
+bridge; it does not extract a minified interpreter function. Node supplies a
+minimal environment with temporary storage, no graphics context, and no rendered
+layout. VM execution errors and timeouts stop before finalization or submission.
 
 Compatibility verified locally against the SDK served by the bootstrap on
 2026-11-10: `20260810913b`, SHA-256
 `49d0284bf3eea8a59ebcad0e6b5dd8a53edd4c72606f15bbf51ebe5610a88efd`.
-Initial and synthetic enforcement proof generation passed. A live direct-send
-attempt with a verified authenticated session stopped at preparation because a
-browser challenge was required; no conversation message was submitted. Direct
-server acceptance and changes to prepare/finalize sequencing remain unverified.
-Use browser mode for this case, or `auto` to switch before submission. Updating
-the proof engine does not satisfy a required browser challenge.
+The current frontend's [integrity implementation](https://chatgpt.com/cdn/assets/698524.03fe2e9350.js)
+confirms the finalize fields: `prepare_token`, optional `proofofwork`, and optional
+`turnstile`. The adapter preserves the original proof used for preparation while
+evaluating `dx`, then uses the finalized requirements-token header. Required VM
+evidence is not, by itself, an interactive browser challenge.
+
+A live authenticated prepare → evidence → finalize check passed with
+`turnstile.required=true`. A new conversation also returned the requested
+`sentinel-ok` response, followed by `resume-ok` in the same conversation, in direct
+mode with the test daemon's browser endpoint disabled. Both submitted messages
+were verified through conversation readback. Direct startup prefers the saved
+session instead of recapturing authentication from an available browser.
+This verifies current compatibility for the tested session; SDK changes or
+browser-only requirements can still make direct mode unavailable.
 
 ## ⚠️ Project status
 

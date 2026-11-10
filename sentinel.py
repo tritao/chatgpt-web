@@ -65,37 +65,69 @@ class SentinelSigner:
             raise SentinelCompatibilityError(
                 "Sentinel signer did not generate an initial proof"
             )
-        requirements = self.request(
-            "POST",
-            urljoin(CHATGPT_ORIGIN, "/backend-api/sentinel/chat-requirements/prepare"),
-            json={"p": initial},
-        ).json()
+        try:
+            requirements = self.request(
+                "POST",
+                urljoin(CHATGPT_ORIGIN, "/backend-api/sentinel/chat-requirements/prepare"),
+                json={"p": initial},
+            ).json()
+        except ValueError as error:
+            raise SentinelCompatibilityError("Sentinel prepare returned invalid JSON") from error
         if not isinstance(requirements, dict):
             raise SentinelCompatibilityError("Sentinel prepare returned an invalid response")
+        if requirements.get("force_login"):
+            raise ChatGPTWebError("ChatGPT requires reauthentication; run chatgpt-web login")
+        token = requirements.get("token")
         prepare_token = requirements.get("prepare_token")
-        if not isinstance(prepare_token, str) or not prepare_token:
-            raise SentinelCompatibilityError("Sentinel prepare returned no prepare token")
+        if not (isinstance(token, str) and token) and not (
+            isinstance(prepare_token, str) and prepare_token
+        ):
+            raise SentinelCompatibilityError("Sentinel prepare returned no requirements or prepare token")
         challenge = requirements.get("turnstile", {})
         if not isinstance(challenge, dict):
             raise SentinelCompatibilityError("Sentinel prepare returned an invalid challenge")
-        if challenge.get("required"):
-            raise SentinelCompatibilityError(
-                "Sentinel requires a browser challenge; use browser send mode"
-            )
+        if challenge.get("required") and (
+            not isinstance(challenge.get("dx"), str) or not challenge["dx"]
+        ):
+            raise SentinelCompatibilityError("Sentinel requested VM evidence without a payload")
+        proof_requirement = requirements.get("proofofwork", {})
+        if not isinstance(proof_requirement, dict):
+            raise SentinelCompatibilityError("Sentinel prepare returned invalid proof requirements")
         enforcement = self.run_sentinel_node(
-            ["--requirements-stdin", "--emit-enforcement-json"], requirements
+            ["--requirements-stdin", "--emit-enforcement-json"],
+            {"requirements": requirements, "initial": initial},
         )
         proof = enforcement.get("proof")
         turnstile = enforcement.get("turnstile")
-        if not isinstance(proof, str) or not proof:
-            raise SentinelCompatibilityError(
-                "Sentinel did not return required enforcement tokens"
-            )
-        result = {
-            "openai-sentinel-chat-requirements-prepare-token": prepare_token,
-            "openai-sentinel-proof-token": proof,
-        }
-        if isinstance(turnstile, str) and turnstile:
-            result["openai-sentinel-turnstile-token"] = turnstile
-        return result
+        if proof_requirement.get("required") and (not isinstance(proof, str) or not proof):
+            raise SentinelCompatibilityError("Sentinel returned no required proof of work")
+        if challenge.get("required") and (not isinstance(turnstile, str) or not turnstile):
+            raise SentinelCompatibilityError("Sentinel returned no required VM evidence")
 
+        if not isinstance(token, str) or not token:
+            # The current frontend sends these fields to finalize. Evidence remains
+            # tied to this preparation; do not generate another initial proof here.
+            body = {"prepare_token": prepare_token}
+            for key, value in (("proofofwork", proof), ("turnstile", turnstile)):
+                if isinstance(value, str) and value:
+                    body[key] = value
+            try:
+                finalized = self.request(
+                    "POST",
+                    urljoin(CHATGPT_ORIGIN, "/backend-api/sentinel/chat-requirements/finalize"),
+                    json=body,
+                ).json()
+            except ValueError as error:
+                raise SentinelCompatibilityError("Sentinel finalize returned invalid JSON") from error
+            if not isinstance(finalized, dict):
+                raise SentinelCompatibilityError("Sentinel finalize returned an invalid response")
+            if finalized.get("force_login"):
+                raise ChatGPTWebError("ChatGPT requires reauthentication; run chatgpt-web login")
+            token = finalized.get("token")
+            if not isinstance(token, str) or not token:
+                raise SentinelCompatibilityError("Sentinel finalize returned no requirements token")
+        result = {"openai-sentinel-chat-requirements-token": token}
+        for name, value in (("proof", proof), ("turnstile", turnstile)):
+            if isinstance(value, str) and value:
+                result[f"openai-sentinel-{name}-token"] = value
+        return result

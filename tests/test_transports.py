@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 
 import httpx
 from test_rate_limit import load_client_module
-from sentinel import SentinelSigner, SentinelCompatibilityError
+from sentinel import ChatGPTWebError, SentinelSigner, SentinelCompatibilityError
 
 
 class TransportTests(unittest.TestCase):
@@ -84,6 +84,21 @@ class TransportTests(unittest.TestCase):
         self.client.send_prompt_browser.assert_not_called()
 
 
+class DirectAuthenticationTests(unittest.TestCase):
+    def test_direct_startup_prefers_saved_session_with_browser_available(self):
+        app = load_client_module()
+        for mode in ("direct", "node", "auto"):
+            with self.subTest(mode=mode), patch.dict(os.environ, {"CHATGPT_WEB_SEND_MODE": mode}), \
+                 patch.object(app.httpx, "Client"), \
+                 patch.object(app, "load_auth_snapshot", return_value=("https://chatgpt.com/backend-api/conversations", {})) as saved, \
+                 patch.object(app, "chrome_is_ready", return_value=True), \
+                 patch.object(app, "capture_auth") as capture:
+                with app.ChatGPTWebClient("http://127.0.0.1:9222"):
+                    pass
+                saved.assert_called_once()
+                capture.assert_not_called()
+
+
 class BrowserProcessTests(unittest.TestCase):
     def test_browser_startup_and_existing_conversation_result(self):
         app = load_client_module()
@@ -119,30 +134,107 @@ class BrowserProcessTests(unittest.TestCase):
 
 
 class SentinelTests(unittest.TestCase):
-    def signer(self, requirements):
-        signer = SentinelSigner(Mock(return_value=SimpleNamespace(json=lambda: requirements)))
-        signer.run_sentinel_node = Mock(side_effect=[{"initial": "fixture"}, {"proof": "fixture"}])
+    def signer(self, requirements, finalized=None, evidence=None):
+        replies = [requirements, {"token": "final-fixture"} if finalized is None else finalized]
+        request = Mock(side_effect=[SimpleNamespace(json=lambda value=value: value) for value in replies])
+        signer = SentinelSigner(request)
+        signer.run_sentinel_node = Mock(side_effect=[
+            {"initial": "original-fixture"},
+            {"proof": "proof-fixture", "turnstile": "vm-fixture"} if evidence is None else evidence,
+        ])
         return signer
 
-    def test_required_challenge_fails_before_enforcement(self):
+    def test_required_vm_evidence_keeps_original_preparation_proof(self):
+        requirements = {"prepare_token": "prepared-fixture", "turnstile": {"required": True, "dx": "fixture"},
+                        "proofofwork": {"required": True}}
+        signer = self.signer(requirements)
+        headers = signer.create_sentinel_headers()
+        self.assertEqual(signer.run_sentinel_node.call_args.args[1],
+                         {"requirements": requirements, "initial": "original-fixture"})
+        self.assertEqual(signer.request.call_args.kwargs["json"], {
+            "prepare_token": "prepared-fixture", "proofofwork": "proof-fixture", "turnstile": "vm-fixture",
+        })
+        self.assertTrue(signer.request.call_args.args[1].endswith("/finalize"))
+        self.assertEqual(headers, {
+            "openai-sentinel-chat-requirements-token": "final-fixture",
+            "openai-sentinel-proof-token": "proof-fixture",
+            "openai-sentinel-turnstile-token": "vm-fixture",
+        })
+        self.assertEqual(signer.request.call_count, 2)
+
+    def test_prepare_can_return_a_finalized_token_directly(self):
+        signer = self.signer({"token": "already-final"}, evidence={"proof": None, "turnstile": None})
+        self.assertEqual(signer.create_sentinel_headers(), {
+            "openai-sentinel-chat-requirements-token": "already-final",
+        })
+        self.assertEqual(signer.request.call_count, 1)
+
+    def test_force_login_is_an_authentication_failure_before_enforcement(self):
+        signer = self.signer({"force_login": True})
+        with self.assertRaises(ChatGPTWebError) as error:
+            signer.create_sentinel_headers()
+        self.assertNotIsInstance(error.exception, SentinelCompatibilityError)
+        self.assertEqual(signer.run_sentinel_node.call_count, 1)
+        self.assertEqual(signer.request.call_count, 1)
+
+    def test_invalid_json_is_reported_without_the_response_body(self):
+        for stage in ("prepare", "finalize"):
+            with self.subTest(stage=stage):
+                signer = self.signer({"prepare_token": "fixture"})
+                invalid = SimpleNamespace(json=Mock(side_effect=ValueError("private-response")))
+                prepare = SimpleNamespace(json=lambda: {"prepare_token": "fixture"})
+                signer.request.side_effect = [invalid] if stage == "prepare" else [prepare, invalid]
+                with self.assertRaisesRegex(SentinelCompatibilityError,
+                        "^Sentinel " + stage + " returned invalid JSON$"):
+                    signer.create_sentinel_headers()
+
+    def test_missing_vm_payload_fails_before_enforcement(self):
         signer = self.signer({"prepare_token": "fixture", "turnstile": {"required": True}})
-        with self.assertRaisesRegex(SentinelCompatibilityError, "browser challenge"):
+        with self.assertRaisesRegex(SentinelCompatibilityError, "without a payload"):
             signer.create_sentinel_headers()
         self.assertEqual(signer.run_sentinel_node.call_count, 1)
+        self.assertEqual(signer.request.call_count, 1)
 
     def test_malformed_prepare_is_compatibility_failure(self):
         for response in (None, [], {}, {"prepare_token": ""},
-                         {"prepare_token": "fixture", "turnstile": []}):
+                         {"prepare_token": "fixture", "turnstile": []},
+                         {"prepare_token": "fixture", "proofofwork": []}):
             with self.subTest(response=response):
                 with self.assertRaises(SentinelCompatibilityError):
                     self.signer(response).create_sentinel_headers()
 
-    def test_valid_preparation_preserves_existing_header_flow(self):
-        headers = self.signer({"prepare_token": "fixture"}).create_sentinel_headers()
-        self.assertEqual(headers, {
-            "openai-sentinel-chat-requirements-prepare-token": "fixture",
-            "openai-sentinel-proof-token": "fixture",
+    def test_optional_evidence_is_omitted_from_finalize_and_headers(self):
+        signer = self.signer({"prepare_token": "fixture"}, evidence={"proof": None, "turnstile": None})
+        self.assertEqual(signer.create_sentinel_headers(), {
+            "openai-sentinel-chat-requirements-token": "final-fixture",
         })
+        self.assertEqual(signer.request.call_args.kwargs["json"], {"prepare_token": "fixture"})
+
+    def test_missing_required_evidence_never_finalizes(self):
+        for requirements, evidence in (
+            ({"proofofwork": {"required": True}}, {"proof": None}),
+            ({"turnstile": {"required": True, "dx": "fixture"}}, {"turnstile": None}),
+        ):
+            with self.subTest(requirements=requirements):
+                signer = self.signer({"prepare_token": "fixture", **requirements}, evidence=evidence)
+                with self.assertRaises(SentinelCompatibilityError):
+                    signer.create_sentinel_headers()
+                self.assertEqual(signer.request.call_count, 1)
+
+    def test_invalid_finalized_response_never_becomes_a_header(self):
+        for response in ([], {}, {"token": ""}, {"token": 123}):
+            with self.subTest(response=response):
+                with self.assertRaises(SentinelCompatibilityError):
+                    self.signer({"prepare_token": "fixture"}, finalized=response).create_sentinel_headers()
+
+    def test_sdk_error_stops_before_finalize(self):
+        signer = self.signer({"prepare_token": "fixture"})
+        signer.run_sentinel_node.side_effect = [
+            {"initial": "fixture"}, SentinelCompatibilityError("VM could not complete"),
+        ]
+        with self.assertRaises(SentinelCompatibilityError):
+            signer.create_sentinel_headers()
+        self.assertEqual(signer.request.call_count, 1)
 
 
 class SignerProcessTests(unittest.TestCase):
@@ -155,3 +247,27 @@ class SignerProcessTests(unittest.TestCase):
             with self.subTest(result=result), patch("sentinel.subprocess.run", return_value=result):
                 with self.assertRaises(SentinelCompatibilityError):
                     SentinelSigner(Mock()).run_sentinel_node(["--emit-initial"])
+
+
+class DirectStreamTests(unittest.TestCase):
+    def test_finalized_headers_and_supported_compression_reach_the_stream(self):
+        app = load_client_module()
+        client = object.__new__(app.ChatGPTWebClient)
+        client.headers = {"accept-encoding": "br, zstd"}
+        client.create_sentinel_headers = Mock(side_effect=AssertionError("must reuse finalized headers"))
+        client.create_conversation_body = Mock(return_value={"messages": [{"id": "sent-fixture"}]})
+        received = []
+        def handle(request):
+            received.append(request)
+            return httpx.Response(200, headers={"content-type": "text/event-stream"}, text=(
+                'data: {"conversation_id":"conversation-fixture","message":{"author":{"role":"assistant"},'
+                '"content":{"content_type":"text","parts":["sentinel-ok"]}}}\n\ndata: [DONE]\n\n'))
+        events = []
+        with httpx.Client(transport=httpx.MockTransport(handle)) as client.http:
+            result = client.send_prompt_direct(None, "hello", [], events.append,
+                sentinel_headers={"openai-sentinel-chat-requirements-token": "final-fixture"})
+        self.assertEqual(result, ("conversation-fixture", "sent-fixture"))
+        self.assertEqual(events, [{"type": "delta", "text": "sentinel-ok"}])
+        self.assertEqual(len(received), 1)
+        self.assertEqual(received[0].headers["accept-encoding"], "gzip, deflate")
+        self.assertEqual(received[0].headers["openai-sentinel-chat-requirements-token"], "final-fixture")
