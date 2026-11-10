@@ -198,6 +198,23 @@ conversation history before manually sending again.
 The direct sender does not retry HTTP `429` responses or unavailable composers.
 This avoids retry loops that can extend a rate limit.
 
+### Connection handling and progress
+
+The daemon uses a pooled HTTPX async client behind a synchronous adapter.
+[AnyIO's Happy Eyeballs implementation](https://anyio.readthedocs.io/en/stable/api.html#anyio.connect_tcp)
+tries IPv4 shortly after a pending IPv6 connection attempt (normally 250 ms).
+Only the winning TCP connection sends the HTTP request; the adapter does not
+retry a submitted message. Working IPv6 remains supported.
+
+TCP connections have a 10-second deadline, separate from ordinary 30-second
+response waits and the 300-second response-stream timeout. Standard HTTPX TLS
+verification and proxy environment handling are preserved.
+
+The terminal reports the current stage: connecting, preparing security evidence,
+finalizing, waiting for ChatGPT, or refreshing conversation history. JSONL output
+includes additive `status` events with fixed stage names and no request data.
+Restart the daemon and reopen the UI to load networking and progress changes.
+
 ## 🧪 Development setup
 
 The `run` launcher uses the PEP 723 metadata embedded in `chatgpt-web` and lets

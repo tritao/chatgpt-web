@@ -2,6 +2,7 @@
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
+#   "anyio>=4,<5",
 #   "httpx>=0.27,<1",
 #   "prompt-toolkit>=3.0,<4",
 #   "rich>=13,<15",
@@ -32,6 +33,7 @@ from urllib.parse import urljoin, urlsplit
 
 import httpx
 
+from network import CONNECT_TIMEOUT, HTTPClient, connection_progress
 from retry_after import rate_limit_message
 from sentinel import ChatGPTWebError, SentinelCompatibilityError, SentinelSigner
 
@@ -251,11 +253,15 @@ class ChatGPTWebClient:
         self.cdp_url = cdp_url
         self.list_url = ""
         self.headers: dict[str, str] = {}
-        self.http = httpx.Client(
+        self.http = HTTPClient(
             follow_redirects=False,
-            timeout=httpx.Timeout(30.0),
+            timeout=httpx.Timeout(30.0, connect=CONNECT_TIMEOUT),
         )
-        self.refresh_auth(prefer_browser=send_mode() in {"browser", "recipe"})
+        try:
+            self.refresh_auth(prefer_browser=send_mode() in {"browser", "recipe"})
+        except BaseException:
+            self.http.close()
+            raise
 
     def close(self) -> None:
         self.http.close()
@@ -284,8 +290,7 @@ class ChatGPTWebClient:
         headers.pop("authorization", None)
         response = self.http.get(
             urljoin(CHATGPT_ORIGIN, "/api/auth/session"),
-            headers=headers,
-            timeout=30,
+            headers={**headers, "accept-encoding": "gzip, deflate"},
         )
         if response.status_code != 200:
             raise ChatGPTWebError(
@@ -406,9 +411,14 @@ class ChatGPTWebClient:
         mode = send_mode()
         if attachments and mode not in {"direct", "auto"}:
             raise ChatGPTWebError("image attachments require CHATGPT_WEB_SEND_MODE=direct")
+        def progress(stage):
+            if on_event is not None:
+                on_event({"type": "status", "stage": stage})
+
         previous_ids: set[str] = set()
         previous: dict[str, Any] | None = None
         if conversation_id:
+            progress("loading_conversation")
             previous = self.get_conversation(conversation_id)
             previous_messages = previous.get("messages", [])
             if isinstance(previous_messages, list):
@@ -418,6 +428,7 @@ class ChatGPTWebClient:
                 }
 
         if mode == "browser":
+            progress("browser")
             return self.send_prompt_browser(conversation_id, prompt, previous_ids, on_event)
 
         # Only signing failures occur before submission. Never catch HTTP, stream,
@@ -425,15 +436,18 @@ class ChatGPTWebClient:
         sentinel_headers = None
         if mode != "recipe":
             try:
-                sentinel_headers = self.create_sentinel_headers()
+                sentinel_headers = self.create_sentinel_headers(on_event=on_event)
             except SentinelCompatibilityError:
                 if mode != "auto" or attachments:
                     raise
+                progress("browser")
                 return self.send_prompt_browser(conversation_id, prompt, previous_ids, on_event)
+        progress("waiting_response")
         resolved_id, submitted_message_id = self.send_prompt_direct(
             previous, prompt, attachments or [], on_event,
             sentinel_headers=sentinel_headers, recipe=mode == "recipe",
         )
+        progress("refreshing_conversation")
         conversation = self.get_conversation(resolved_id)
         messages = conversation.get("messages", [])
         attached = isinstance(messages, list) and any(
@@ -531,7 +545,7 @@ class ChatGPTWebClient:
             method, url, headers, body = self.capture_send_recipe(conversation_id, prompt)
         else:
             if sentinel_headers is None:
-                sentinel_headers = self.create_sentinel_headers()
+                sentinel_headers = self.create_sentinel_headers(on_event=on_event)
             method = "POST"
             url = urljoin(CHATGPT_ORIGIN, "/backend-api/f/conversation")
             headers = self.headers.copy()
@@ -554,7 +568,8 @@ class ChatGPTWebClient:
             url,
             headers=headers,
             json=body,
-            timeout=httpx.Timeout(300.0),
+            timeout=httpx.Timeout(300.0, connect=CONNECT_TIMEOUT),
+            extensions=connection_progress(on_event, "waiting_response"),
         ) as response:
             if response.status_code == 429:
                 raise ChatGPTWebError(
@@ -602,8 +617,21 @@ class ChatGPTWebClient:
             raise ChatGPTWebError("ChatGPT did not return a conversation ID")
         return resolved_id, submitted_message_id
 
-    def create_sentinel_headers(self) -> dict[str, str]:
-        return SentinelSigner(self.request).create_sentinel_headers()
+    def create_sentinel_headers(self, on_event: Any = None) -> dict[str, str]:
+        stage = "preparing_requirements"
+
+        def progress(value):
+            nonlocal stage
+            stage = value
+            if on_event is not None:
+                on_event({"type": "status", "stage": value})
+
+        def request(method, url, **options):
+            if on_event is not None:
+                options["extensions"] = connection_progress(on_event, stage)
+            return self.request(method, url, **options)
+
+        return SentinelSigner(request, on_progress=progress).create_sentinel_headers()
 
     def create_conversation_body(
         self,
@@ -724,7 +752,7 @@ class ChatGPTWebClient:
             upload_url,
             content=data,
             headers={"content-type": mime_type, "x-ms-blob-type": "BlockBlob"},
-            timeout=60,
+            timeout=httpx.Timeout(60.0, connect=CONNECT_TIMEOUT),
         )
         upload.raise_for_status()
         finalized = self.request(
@@ -1126,6 +1154,8 @@ def run_fullscreen(
         on_event: Any,
         on_connection: Any,
     ) -> dict[str, Any]:
+        if on_event is not None:
+            on_event({"type": "status", "stage": "starting_service"})
         ensure_service()
         result = daemon_stream_request(socket_path, {
             "command": "send_stream",

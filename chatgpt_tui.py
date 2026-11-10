@@ -1362,6 +1362,24 @@ class ChatTui:
         def on_event(event: dict[str, Any]) -> None:
             nonlocal rendered
             event_type = event.get("type")
+            if event_type == "status":
+                labels = {
+                    "starting_service": "Starting local service…",
+                    "connecting": "Connecting to ChatGPT…",
+                    "loading_conversation": "Loading conversation…",
+                    "generating_proof": "Preparing security proof…",
+                    "preparing_requirements": "Checking request requirements…",
+                    "evaluating_evidence": "Completing security checks…",
+                    "finalizing": "Finalizing secure request…",
+                    "waiting_response": "Waiting for ChatGPT…",
+                    "refreshing_conversation": "Refreshing conversation…",
+                    "browser": "Sending through ChatGPT website…",
+                }
+                label = labels.get(event.get("stage"))
+                if label:
+                    self.status = label
+                    self.app.invalidate()
+                return
             text = event.get("text")
             if event_type == "delta" and isinstance(text, str):
                 rendered += text

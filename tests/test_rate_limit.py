@@ -102,7 +102,7 @@ class RetryAfterTests(unittest.TestCase):
         app = load_client_module()
         client = object.__new__(app.ChatGPTWebClient)
         client.headers = {}
-        client.create_sentinel_headers = lambda: {}
+        client.create_sentinel_headers = lambda **_kwargs: {}
         client.create_conversation_body = lambda *args: {"messages": [{"id": "test-id"}]}
         response = SimpleNamespace(status_code=429, headers={"retry-after": "53"})
         client.http = SimpleNamespace(

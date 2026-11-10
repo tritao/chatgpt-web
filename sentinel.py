@@ -19,8 +19,9 @@ class SentinelCompatibilityError(ChatGPTWebError):
 
 
 class SentinelSigner:
-    def __init__(self, request):
+    def __init__(self, request, on_progress=None):
         self.request = request
+        self.on_progress = on_progress or (lambda _stage: None)
 
     def run_sentinel_node(
         self, arguments: list[str], payload: dict[str, Any] | None = None
@@ -60,11 +61,13 @@ class SentinelSigner:
         return value
 
     def create_sentinel_headers(self) -> dict[str, str]:
+        self.on_progress("generating_proof")
         initial = self.run_sentinel_node(["--emit-initial"]).get("initial")
         if not isinstance(initial, str) or not initial:
             raise SentinelCompatibilityError(
                 "Sentinel signer did not generate an initial proof"
             )
+        self.on_progress("preparing_requirements")
         try:
             requirements = self.request(
                 "POST",
@@ -93,6 +96,7 @@ class SentinelSigner:
         proof_requirement = requirements.get("proofofwork", {})
         if not isinstance(proof_requirement, dict):
             raise SentinelCompatibilityError("Sentinel prepare returned invalid proof requirements")
+        self.on_progress("evaluating_evidence")
         enforcement = self.run_sentinel_node(
             ["--requirements-stdin", "--emit-enforcement-json"],
             {"requirements": requirements, "initial": initial},
@@ -111,6 +115,7 @@ class SentinelSigner:
             for key, value in (("proofofwork", proof), ("turnstile", turnstile)):
                 if isinstance(value, str) and value:
                     body[key] = value
+            self.on_progress("finalizing")
             try:
                 finalized = self.request(
                     "POST",

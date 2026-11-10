@@ -89,7 +89,7 @@ class DirectAuthenticationTests(unittest.TestCase):
         app = load_client_module()
         for mode in ("direct", "node", "auto"):
             with self.subTest(mode=mode), patch.dict(os.environ, {"CHATGPT_WEB_SEND_MODE": mode}), \
-                 patch.object(app.httpx, "Client"), \
+                 patch.object(app, "HTTPClient"), \
                  patch.object(app, "load_auth_snapshot", return_value=("https://chatgpt.com/backend-api/conversations", {})) as saved, \
                  patch.object(app, "chrome_is_ready", return_value=True), \
                  patch.object(app, "capture_auth") as capture:
