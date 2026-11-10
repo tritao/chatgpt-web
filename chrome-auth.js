@@ -33,7 +33,7 @@ function getJson(url) {
 async function main() {
   const pages = await getJson(`${cdpBase}/json/list`);
   const page = pages.find((item) =>
-    item.type === "page" && item.url.startsWith("https://chatgpt.com"));
+    item.type === "page" && new URL(item.url).origin === "https://chatgpt.com");
   if (!page) {
     fail("no ChatGPT tab found in the debugging browser");
   }
@@ -55,24 +55,21 @@ async function main() {
     socket.send(JSON.stringify({ id: ++sequence, method, params }));
   }
 
-  function isTarget(request) {
-    return request.method === "GET" &&
-      request.url.includes("/backend-api/conversations?") &&
-      !request.url.includes("hide_snorlax") &&
-      request.url.includes("limit=28");
-  }
-
   function finish(requestId) {
     if (finished || !requests.has(requestId) || !extraHeaders.has(requestId)) {
       return;
     }
+    const request = requests.get(requestId);
+    const headers = { ...request.headers, ...extraHeaders.get(requestId) };
+    if (!Object.entries(headers).some(([key, value]) =>
+      key.toLowerCase() === "authorization" && typeof value === "string" &&
+      /^Bearer\s+\S+/i.test(value))) return;
     finished = true;
     clearTimeout(timer);
-    const request = requests.get(requestId);
     const result = {
       url: request.url,
       method: request.method,
-      headers: { ...request.headers, ...extraHeaders.get(requestId) },
+      headers,
     };
     process.stdout.write(JSON.stringify(result));
     socket.close();
@@ -99,4 +96,15 @@ async function main() {
   socket.addEventListener("error", () => fail("lost the Chrome debugger connection"));
 }
 
-main().catch((error) => fail(error.message));
+function isTarget(request) {
+  try {
+    const url = new URL(request.url);
+    return request.method === "GET" && url.origin === "https://chatgpt.com" &&
+      url.pathname === "/backend-api/conversations";
+  } catch (_error) {
+    return false;
+  }
+}
+
+module.exports = { isTarget };
+if (require.main === module) main().catch((error) => fail(error.message));
